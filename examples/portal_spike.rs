@@ -5,8 +5,9 @@
 //! cargo run --example portal_spike
 //! ```
 //!
-//! Hyprland's portal ignores `preferred_trigger`; bind it in `hyprland.conf` instead, e.g.
-//! `bind = CTRL, F13, global, me.maxjoehnk.soundboars:play-test`.
+//! Hyprland's portal ignores `preferred_trigger`; bind it in the Hyprland config instead, e.g.
+//! `hl.bind("CTRL + F13", hl.dsp.global("me.maxjoehnk.soundboars:play-test"))` (Lua config,
+//! Hyprland ≥ 0.55) or `bind = CTRL, F13, global, me.maxjoehnk.soundboars:play-test` (older).
 #![expect(
     clippy::print_stdout,
     reason = "a CLI example whose output is the point"

@@ -14,7 +14,7 @@ injects them into a chosen voice-chat application through PipeWire.
 | GUI | `eframe`/`egui` 0.37, default look. Prototypes in `prototypes/` are throwaway references for milestones 4–7 (trim editor, URL dialog, hotkey/MIDI settings); delete them once those exist. |
 | Injection | Soundux-style "pick an app": an output stream `soundboars-inject` (`Stream/Output/Audio`, no autoconnect) is linked via `link-factory` to the target app's `Stream/Input/Audio` node ports. The app's real mic link (WirePlumber) stays untouched. Target is remembered as `(application.process.binary, application.name)` and auto-relinked when the node reappears. |
 | Local playback | Separate stream `soundboars-local`, autoconnected to the default sink. Each stream mixes independently over shared decoded `Arc<[f32]>` buffers (no cross-clock mixing). |
-| Hotkeys | `trait HotkeyBackend` with two impls: XDG GlobalShortcuts portal (`ashpd`) and X11 (`global-hotkey`, X11-only; won't fire on Wayland-native focus). Backends report capabilities (e.g. Hyprland's portal ignores `preferred_trigger` → UI shows the `hyprland.conf` bind line instead of a record button). |
+| Hotkeys | `trait HotkeyBackend` with two impls: XDG GlobalShortcuts portal (`ashpd`) and X11 (`global-hotkey`, X11-only; won't fire on Wayland-native focus). Backends report capabilities (e.g. Hyprland's portal ignores `preferred_trigger` → UI shows the Hyprland config bind line instead of a record button). |
 | MIDI | `midir`, MIDI-learn mode, `(port name, channel, note/CC)` mapping, hotplug by polling. |
 | Library | Folder-based: every added folder is a tab, watched with `notify`. Per-sound metadata (hotkey, MIDI, trim, volume) lives in `config.toml`, keyed by path relative to its tab folder. |
 | Trimming | **Non-destructive**: `start_ms`/`end_ms` stored in config, audio files never modified. Waveform = min/max peaks computed in the background. |
@@ -129,6 +129,41 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   accessible name or kittest fails). `tests/app_smoke.rs` runs the real binary on the container's
   Xvfb (wgpu on Mesa lavapipe). Icons in labels come from egui's bundled emoji fonts
   (`egui/monochrome_emoji_fonts`); kittest panics on glyphs no bundled font has.
+
+## Hotkeys
+
+- `hotkeys` (library side): `Hotkey` (egui `Key` + Ctrl/Alt/Shift/Super) is stored in the config
+  in one canonical format, `Ctrl+Alt+Shift+Super+<egui key name>` (e.g. `Ctrl+Shift+F13`); an
+  invalid one is dropped with a warning instead of rejecting the file. Only keys with an X11
+  keysym (`hotkey::keysym` table) can be hotkeys; it also yields the XDG `preferred_trigger`
+  (`CTRL+SHIFT+F13`) and Hyprland key (`CTRL + SHIFT + F13`) formats. egui doesn't report Super on
+  Linux, so Super can only be typed into the config.
+- `trait HotkeyBackend { register(&[Binding]), capabilities() }`: `register` replaces the whole set.
+  Events (`Pressed(id)`, `Released(id)`, `Error`) go through an `EventSink` (mpsc + a wake-up that
+  calls `egui::Context::request_repaint`). Backends: `portal::PortalBackend` (ashpd on a
+  `hotkey-portal` thread with `zbus::block_on`; one session per registration, since a session
+  binds only once; registers the host app ID first) and `x11::X11Backend` (`global-hotkey`, one
+  process-wide event handler, so only one may exist; needs `$DISPLAY`).
+  `Capabilities { assign_in_app, bind_hint }`: `portal::capabilities_for($XDG_CURRENT_DESKTOP)`
+  gives Hyprland `BindHint::Hyprland`, whose `snippet` is the Lua bind line
+  `hl.bind("CTRL + F13", hl.dsp.global("me.maxjoehnk.soundboars:<id>"))` (Hyprland ≥ 0.55; older
+  hyprlang configs: `bind = CTRL, F13, global, me.maxjoehnk.soundboars:<id>`).
+- Bindings (`app::hotkeys::bindings`): every sound whose `SoundConfig::shortcut_id` is set (the X11
+  backend skips those without `hotkey`), plus `stop-all` (`Settings::stop_all_hotkey`). Shortcut
+  ids are `play-<slug of the file name>` made unique with `-2`, `-3`…, assigned when a hotkey is
+  recorded or (Hyprland) "Add global shortcut" is clicked, and never changed afterwards (users
+  type them into their compositor config); removing and re-adding keeps the saved id.
+- `app::hotkeys::Hotkeys` owns the backend: `App::apply` ends with `sync_hotkeys()`, which restarts
+  the backend when `AppState::hotkey_backend()` (setting, else portal on Wayland / X11) changed and
+  re-registers when the binding set changed. Presses become `Action::Play` / `Action::StopAll`.
+- UI: `ui::hotkey_section` (editor section; `recorder` and `bind_hint` widgets are reused by the
+  settings for "Stop all"). Recording takes the next key press with a hotkey key from the
+  window's input (logical key, physical as fallback); Esc cancels.
+- Known limit: hotkeys are handled in the frame loop. On Wayland, a window that's hidden (other
+  workspace, minimized) may get no frames, so presses wait until it's shown again.
+- Tests: `tests/portal_hotkeys.rs` runs a zbus mock of the portal on the container's session bus;
+  `tests/x11_hotkeys.rs` presses keys with `xdotool` on Xvfb (no F13+ in its keymap). Both are
+  gated like the PipeWire tests.
 
 ## Tiling window managers
 
