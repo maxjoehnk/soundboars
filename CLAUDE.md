@@ -11,7 +11,7 @@ injects them into a chosen voice-chat application through PipeWire.
 
 | Area | Decision |
 |---|---|
-| GUI | `eframe`/`egui` 0.37, default look. Prototypes in `prototypes/` are throwaway and get deleted once the real UI exists. |
+| GUI | `eframe`/`egui` 0.37, default look. Prototypes in `prototypes/` are throwaway references for milestones 4–7 (trim editor, URL dialog, hotkey/MIDI settings); delete them once those exist. |
 | Injection | Soundux-style "pick an app": an output stream `soundboars-inject` (`Stream/Output/Audio`, no autoconnect) is linked via `link-factory` to the target app's `Stream/Input/Audio` node ports. The app's real mic link (WirePlumber) stays untouched. Target is remembered as `(application.process.binary, application.name)` and auto-relinked when the node reappears. |
 | Local playback | Separate stream `soundboars-local`, autoconnected to the default sink. Each stream mixes independently over shared decoded `Arc<[f32]>` buffers (no cross-clock mixing). |
 | Hotkeys | `trait HotkeyBackend` with two impls: XDG GlobalShortcuts portal (`ashpd`) and X11 (`global-hotkey`, X11-only; won't fire on Wayland-native focus). Backends report capabilities (e.g. Hyprland's portal ignores `preferred_trigger` → UI shows the `hyprland.conf` bind line instead of a record button). |
@@ -91,13 +91,34 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   and their `info` (PROPS change only) is watched. Links are reconciled against a pure plan
   (`audio::link_plan`) on every graph change; a link lives as long as its proxy (`object.linger = false`).
 
+## App architecture
+
+- `config` (`Config`, `ConfigStore`): one TOML file, every struct `#[serde(default)]` (new fields
+  must have defaults; unknown fields are ignored). Per-sound data: `tabs[i].sounds["<file>"]`
+  (`SoundConfig`, keyed by path relative to the tab folder). `$SOUNDBOARS_CONFIG` overrides the path.
+- `library`: tab = one folder, non-recursive, sorted by name; `watch::FolderWatcher` (impl
+  `NotifyWatcher`) reports `FolderEvent::{Listing, Contents}`.
+- `app`: `App` owns `AppState` (pure, unit-tested logic: visible sounds, play requests, progress)
+  plus `Services` (`AudioBackend` = `AudioEngine` or a fake, `FolderWatcher`, `FolderPicker`,
+  `ConfigStore`). Each frame: `poll()` services → `ui::draw(&AppState) -> Vec<Action>` → `apply()`
+  → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
+  and emits `Action`s; it never mutates state or calls services. Settings go through
+  `Action::ChangeSetting(Setting)`. `app::targets::Targets` decides auto-relinking.
+- New features: add an `Action` variant + `apply` arm, a module under `app/` for logic, and a file
+  under `app/ui/` for drawing; keep edits to shared files (`app/mod.rs`, `app/ui/mod.rs`,
+  `config.rs`) to small, additive insertions.
+- GUI tests: `tests/gui.rs` (`egui_kittest`, fakes, AccessKit queries — every widget needs an
+  accessible name or kittest fails). `tests/app_smoke.rs` runs the real binary on the container's
+  Xvfb (wgpu on Mesa lavapipe). Icons in labels come from egui's bundled emoji fonts
+  (`egui/monochrome_emoji_fonts`); kittest panics on glyphs no bundled font has.
+
 ## Milestones
 
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Docker/CI harness + spike: inject stream, list recording apps, link into one; portal shortcut registration | done |
 | 2 | Audio engine: decoding + cache, both streams, voices, retrigger modes, volumes, limiter | done |
-| 3 | App UI: folder tabs, `notify`, config, target picker with auto-relink | todo |
+| 3 | App UI: folder tabs, `notify`, config, target picker with auto-relink | done |
 | 4 | Hotkeys: trait, portal backend (with Hyprland bind hints), X11 backend | todo |
 | 5 | MIDI: midir, learn mode, hotplug | todo |
 | 6 | Trim editor: waveform peaks, non-destructive trim, preview | todo |
