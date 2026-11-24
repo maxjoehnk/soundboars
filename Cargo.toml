@@ -2,7 +2,7 @@
 name = "soundboars"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A PipeWire soundboard that injects sounds into voice chat applications"
 publish = false
 
@@ -13,6 +13,8 @@ thiserror = "2"
 
 [dev-dependencies]
 anyhow = "1"
+ashpd = { version = "0.14", default-features = false, features = ["async-io", "global_shortcuts"] }
+futures-util = { version = "0.3", default-features = false }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
