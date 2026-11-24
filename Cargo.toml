@@ -14,6 +14,7 @@ directories = "6"
 eframe = "0.37"
 # Bundles egui's emoji/icon fonts, so the icons in labels (⟳, ⚙, ⏹, …) render without system fonts.
 egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+midir = "0.11"
 notify = "8"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
