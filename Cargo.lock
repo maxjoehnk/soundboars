@@ -3720,6 +3720,7 @@ dependencies = [
  "egui",
  "egui_kittest",
  "futures-util",
+ "libc",
  "midir",
  "notify",
  "pipewire",

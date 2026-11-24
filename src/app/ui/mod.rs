@@ -7,6 +7,7 @@ mod midi_section;
 mod settings;
 mod sound_editor;
 mod top_bar;
+mod url_import;
 
 use eframe::egui;
 
@@ -20,6 +21,7 @@ pub fn draw(ui: &mut egui::Ui, state: &AppState) -> Vec<Action> {
     egui::CentralPanel::default().show(ui, |ui| board::show(ui, state, &mut actions));
     settings::show(ui.ctx(), state, &mut actions);
     sound_editor::show(ui.ctx(), state, &mut actions);
+    url_import::show(ui.ctx(), state, &mut actions);
     actions
 }
 

@@ -42,10 +42,9 @@ fn empty_message(state: &AppState) -> String {
         None => {
             "Add a folder with “➕ Folder”; its audio files become the sounds of a tab.".to_owned()
         }
-        Some(folder) => folder
-            .error
-            .clone()
-            .unwrap_or_else(|| "No sounds. Drop audio files into this folder.".to_owned()),
+        Some(folder) => folder.error.clone().unwrap_or_else(|| {
+            "No sounds. Drop audio files into this folder or use “Add from URL”.".to_owned()
+        }),
     }
 }
 

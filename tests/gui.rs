@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use eframe::egui::accesskit::Role;
 use eframe::egui::{Pos2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use soundboars::app::{App, AudioBackend, FolderPicker, Services};
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
 use soundboars::config::{Config, ConfigStore, SavedTarget, SoundConfig, TabConfig, Theme};
+use soundboars::import::{DownloadEvent, Downloader, Stage};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
 use soundboars::midi::{
     Connection, HOTPLUG_POLL, MidiBinding, MidiControl, MidiDevice, MidiError, MidiInput, MidiPort,
@@ -45,6 +46,12 @@ struct World {
     watched: Vec<PathBuf>,
     folder_events: Vec<FolderEvent>,
     folder_to_pick: Option<PathBuf>,
+    /// What the fake downloader reports as missing.
+    downloader_unavailable: Option<String>,
+    /// The `(url, folder)` of every started download.
+    downloads: Vec<(String, PathBuf)>,
+    cancelled_downloads: usize,
+    download_events: Vec<DownloadEvent>,
 }
 
 #[derive(Clone, Default)]
@@ -171,6 +178,25 @@ impl MidiInput for FakeMidi {
 const MPD: &str = "MPD218:MPD218 MIDI 1";
 const MPD_ID: &str = "20:0";
 
+struct FakeDownloader(Shared);
+
+impl Downloader for FakeDownloader {
+    fn unavailable(&self) -> Option<String> {
+        self.0.with(|world| world.downloader_unavailable.clone())
+    }
+    fn start(&mut self, url: &str, folder: &Path) {
+        self.0
+            .with(|world| world.downloads.push((url.to_owned(), folder.to_owned())));
+    }
+    fn cancel(&mut self) {
+        self.0.with(|world| world.cancelled_downloads += 1);
+    }
+    fn poll(&mut self) -> Vec<DownloadEvent> {
+        self.0
+            .with(|world| std::mem::take(&mut world.download_events))
+    }
+}
+
 /// Two tabs: `Memes` (Airhorn, Bruh) and `SFX` (Applause, Horn). Airhorn has a volume and a trim.
 /// One MIDI port, the MPD218.
 struct Setup {
@@ -256,6 +282,7 @@ impl Setup {
             folder_picker: Box::new(FakePicker(self.shared.clone())),
             config: self.store.clone(),
             midi: None,
+            downloader: Box::new(FakeDownloader(self.shared.clone())),
         };
         let midi = Box::new(self.midi.clone());
         let mut harness = Harness::builder()
@@ -1174,4 +1201,226 @@ fn stop_all_can_be_learned_in_the_settings() {
     harness.get_by_label("Clear").click();
     harness.run();
     assert_eq!(setup.config().settings.midi_stop_all, None);
+}
+
+// "Add sound from URL", with a fake downloader.
+
+const URL_DIALOG: &str = "Add sound from URL";
+const URL_FIELD: &str = "Paste a YouTube (or any yt-dlp supported) URL:";
+const ADD_FROM_URL: &str = "🔗 Add from URL";
+const DOWNLOAD: &str = "⬇ Download";
+/// Frames to run after each input: the progress bar animates while downloading, so the UI never
+/// settles for `Harness::run`.
+const STEPS: usize = 4;
+
+fn report_download(setup: &Setup, harness: &mut Harness<'_, App>, event: DownloadEvent) {
+    setup.shared.with(|world| world.download_events.push(event));
+    harness.run_steps(STEPS);
+}
+
+fn downloads(setup: &Setup) -> Vec<(String, PathBuf)> {
+    setup.shared.with(|world| world.downloads.clone())
+}
+
+fn cancelled_downloads(setup: &Setup) -> usize {
+    setup.shared.with(|world| world.cancelled_downloads)
+}
+
+fn type_url(harness: &mut Harness<'_, App>, url: &str) {
+    let field = harness.get_by_label(URL_FIELD);
+    field.click();
+    field.type_text(url);
+    harness.run_steps(STEPS);
+}
+
+/// Opens the dialog and types `url`.
+fn enter_url(harness: &mut Harness<'_, App>, url: &str) {
+    harness.get_by_label(ADD_FROM_URL).click();
+    harness.run_steps(STEPS);
+    type_url(harness, url);
+}
+
+#[test]
+fn add_from_url_is_disabled_without_the_tools() {
+    let setup = Setup::new();
+    setup.shared.with(|world| {
+        world.downloader_unavailable = Some("Install yt-dlp (not found: yt-dlp).".to_owned())
+    });
+    let mut harness = setup.start();
+
+    let button = harness.get_by_label(ADD_FROM_URL);
+    assert!(button.accesskit_node().is_disabled());
+    button.hover();
+    harness.run_steps(STEPS);
+    assert!(
+        harness
+            .query_by_label_contains("not found: yt-dlp")
+            .is_some()
+    );
+    harness.get_by_label(ADD_FROM_URL).click();
+    harness.run_steps(STEPS);
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+}
+
+#[test]
+fn a_downloaded_sound_opens_in_the_editor_in_its_tab() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    enter_url(&mut harness, "youtube.com/watch?v=1");
+    assert!(harness.query_by_label(URL_DIALOG).is_some());
+    assert!(
+        harness
+            .get_by_label(DOWNLOAD)
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        harness
+            .query_by_label_contains("http:// or https://")
+            .is_some()
+    );
+
+    harness
+        .get_by_label(URL_FIELD)
+        .set_text_value_accesskit("https://example.com/clip");
+    harness.run_steps(STEPS);
+    harness.get_by_label("Save to tab:").click();
+    harness.run_steps(STEPS);
+    let tabs = harness.query_all_by_label("SFX").collect::<Vec<_>>();
+    tabs.last().expect("the picker lists SFX").click();
+    harness.run_steps(STEPS);
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    let sfx = setup.folder("SFX");
+    assert_eq!(
+        downloads(&setup),
+        [("https://example.com/clip".to_owned(), sfx.clone())]
+    );
+    let half = DownloadEvent::Progress(Stage::Downloading(Some(0.5)));
+    report_download(&setup, &mut harness, half);
+    assert!(
+        harness
+            .query_by_label_contains("Downloading… 50%")
+            .is_some()
+    );
+    assert!(
+        harness
+            .get_by_label(DOWNLOAD)
+            .accesskit_node()
+            .is_disabled()
+    );
+    let converting = DownloadEvent::Progress(Stage::Converting);
+    report_download(&setup, &mut harness, converting);
+    assert!(
+        harness
+            .query_by_label_contains("Converting to MP3…")
+            .is_some()
+    );
+
+    // The folder watcher hasn't reported the new file yet.
+    let clip = sfx.join("Clip.mp3");
+    fs::write(&clip, b"").expect("write");
+    setup.shared.clear_calls();
+    report_download(&setup, &mut harness, DownloadEvent::Done(clip.clone()));
+
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+    assert!(harness.query_by_label("Edit sound – Clip.mp3").is_some());
+    assert_eq!(setup.shared.calls(), [Call::LoadWaveform(clip)]);
+    assert!(
+        harness.query_by_label(&tile("Applause")).is_some(),
+        "SFX is shown"
+    );
+    assert!(harness.query_by_label(&tile("Bruh")).is_none());
+    assert_eq!(cancelled_downloads(&setup), 0);
+}
+
+#[test]
+fn a_failed_download_shows_why_and_can_be_retried() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    enter_url(&mut harness, "https://example.com/gone");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    let failed = DownloadEvent::Failed("HTTP Error 404: File not found".to_owned());
+    report_download(&setup, &mut harness, failed);
+    assert!(
+        harness
+            .query_by_label("Failed: HTTP Error 404: File not found")
+            .is_some()
+    );
+    harness.get_by_label("⟳ Retry").click();
+    harness.run_steps(STEPS);
+
+    let download = ("https://example.com/gone".to_owned(), setup.folder("Memes"));
+    assert_eq!(
+        downloads(&setup),
+        [download.clone(), download],
+        "into the current tab by default"
+    );
+    assert!(harness.query_by_label_contains("Failed:").is_none());
+    assert!(harness.query_by_label_contains("Starting…").is_some());
+}
+
+#[test]
+fn closing_the_dialog_cancels_the_download() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    enter_url(&mut harness, "https://example.com/long");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    harness.get_by_label("Cancel").click();
+    harness.run_steps(STEPS);
+
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+    assert_eq!(cancelled_downloads(&setup), 1);
+
+    enter_url(&mut harness, "https://example.com/long");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+    // Kittest embeds dialogs in the main window, where its close request is the main viewport's.
+    harness
+        .input_mut()
+        .viewports
+        .entry(ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(ViewportEvent::Close);
+    harness.run_steps(STEPS);
+
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+    assert_eq!(cancelled_downloads(&setup), 2);
+}
+
+#[test]
+fn without_tabs_the_dialog_asks_for_a_folder_first() {
+    let setup = Setup::new().with_config(|config| config.tabs.clear());
+    let music = setup.folder("Music");
+    fs::create_dir(&music).expect("mkdir");
+    setup
+        .shared
+        .with(|world| world.folder_to_pick = Some(music.clone()));
+    let mut harness = setup.start();
+
+    harness.get_by_label(ADD_FROM_URL).click();
+    harness.run_steps(STEPS);
+    assert!(
+        harness
+            .query_by_label_contains("Add a folder as a tab first")
+            .is_some()
+    );
+    assert!(harness.query_by_label(URL_FIELD).is_none());
+
+    harness.get_by_label("➕ Add folder").click();
+    harness.run_steps(STEPS);
+    type_url(&mut harness, "https://example.com/a");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    assert_eq!(
+        downloads(&setup),
+        [("https://example.com/a".to_owned(), music)]
+    );
 }

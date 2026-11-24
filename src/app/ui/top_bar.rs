@@ -1,4 +1,4 @@
-//! Target picker, settings button, tabs and search.
+//! Target picker, settings and "Add from URL" buttons, tabs and search.
 
 use eframe::egui;
 
@@ -16,6 +16,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
                 if ui.button("⚙ Settings").clicked() {
                     actions.push(Action::ShowSettings(true));
                 }
+                url_import_button(ui, state, actions);
             });
         });
         ui.add_space(4.0);
@@ -27,6 +28,18 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
         });
         ui.add_space(4.0);
     });
+}
+
+/// Disabled, with the reason as tooltip, when yt-dlp or ffmpeg are missing.
+fn url_import_button(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    let unavailable = state.url_import_unavailable.as_deref();
+    let button = ui
+        .add_enabled(unavailable.is_none(), egui::Button::new("🔗 Add from URL"))
+        .on_hover_text("Download a sound from YouTube or another site")
+        .on_disabled_hover_text(unavailable.unwrap_or_default());
+    if button.clicked() {
+        actions.push(Action::OpenUrlImport);
+    }
 }
 
 fn target_picker(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
