@@ -1,5 +1,4 @@
 /target
-/prototypes/target
 *.log
 /.ci-cargo
 /.claude/worktrees/

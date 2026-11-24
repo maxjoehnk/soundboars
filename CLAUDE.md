@@ -11,14 +11,14 @@ injects them into a chosen voice-chat application through PipeWire.
 
 | Area | Decision |
 |---|---|
-| GUI | `eframe`/`egui` 0.37, default look. Prototypes in `prototypes/` are throwaway references for milestones 4–7 (trim editor, URL dialog, hotkey/MIDI settings); delete them once those exist. |
+| GUI | `eframe`/`egui` 0.37, default look. Dialogs are separate OS windows. |
 | Injection | Soundux-style "pick an app": an output stream `soundboars-inject` (`Stream/Output/Audio`, no autoconnect) is linked via `link-factory` to the target app's `Stream/Input/Audio` node ports. The app's real mic link (WirePlumber) stays untouched. Target is remembered as `(application.process.binary, application.name)` and auto-relinked when the node reappears. |
 | Local playback | Separate stream `soundboars-local`, autoconnected to the default sink. Each stream mixes independently over shared decoded `Arc<[f32]>` buffers (no cross-clock mixing). |
 | Hotkeys | `trait HotkeyBackend` with two impls: XDG GlobalShortcuts portal (`ashpd`) and X11 (`global-hotkey`, X11-only; won't fire on Wayland-native focus). Backends report capabilities (e.g. Hyprland's portal ignores `preferred_trigger` → UI shows the Hyprland config bind line instead of a record button). |
 | MIDI | `midir`, MIDI-learn mode, `(port name, channel, note/CC)` mapping, hotplug by polling. |
 | Library | Folder-based: every added folder is a tab, watched with `notify`. Per-sound metadata (hotkey, MIDI, trim, volume) lives in `config.toml`, keyed by path relative to its tab folder. |
 | Trimming | **Non-destructive**: `start_ms`/`end_ms` stored in config, audio files never modified. Waveform = min/max peaks computed in the background. |
-| URL import | Spawn `yt-dlp -x --audio-format mp3 …` into the chosen tab folder, parse progress, then open the trim editor. |
+| URL import | Spawn `yt-dlp -x --audio-format mp3 …` into the chosen tab folder (via a hidden staging folder), parse progress, then open "Edit sound" (trim editor). |
 | Decoding | `symphonia` (no Opus decoder in 0.6!), resample with `rubato` to 48 kHz stereo f32. |
 | Config | `serde` + `toml` in `$XDG_CONFIG_HOME/soundboars/config.toml` (`directories` crate). |
 
@@ -108,11 +108,12 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   count, full decode as fallback); tiles show the trimmed length (`SoundConfig::trimmed_length`).
 - `app`: `App` owns `AppState` (pure, unit-tested logic: visible sounds, play requests, progress)
   plus `Services` (`AudioBackend` = `AudioEngine` or a fake, `FolderWatcher`, `FolderPicker`,
-  `ConfigStore`, `Downloader`, `HotkeyBackends`, `MidiInput`). `App::new(services, ctx)` starts the
-  background threads with `ctx.request_repaint` as their wake-up. Each frame: `poll()` services → `ui::draw(&AppState)
-  -> Vec<Action>` → `apply()` → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
-  and emits `Action`s; it never mutates state or calls services. Settings go through
-  `Action::ChangeSetting(Setting)`. `app::targets::Targets` decides auto-relinking.
+  `ConfigStore`, `Downloader`, `HotkeyBackends`, `MidiInput`). `App::new(services, ctx)` starts
+  the background threads with `ctx.request_repaint` as their wake-up. Each frame: `poll()` services
+  → `ui::draw(&AppState) -> Vec<Action>` → `apply()` → save config when dirty and no pointer button
+  is held. UI code (`app/ui/*`) only reads state and emits `Action`s; it never mutates state or
+  calls services. Settings go through `Action::ChangeSetting(Setting)`. `app::targets::Targets`
+  decides auto-relinking.
 - Hotkeys and MIDI triggers don't go through the frame loop (a hidden Wayland window may get no
   frames): `app::triggers::Dispatcher` runs a `triggers` thread that receives `Trigger::{Hotkey(id),
   Midi(..)}` from the hotkey `EventSink` and the MIDI `on_trigger` callback, resolves them against a
@@ -150,9 +151,9 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   Linux, so Super can only be typed into the config.
 - `trait HotkeyBackend { register(&[Binding]), capabilities() }`: `register` replaces the whole set.
   Events (`Pressed(id)`, `Released(id)`, `Error`) go to an `EventSink` (a callback, called on the
-  backend's thread). Backends: `portal::PortalBackend` (ashpd on a
-  `hotkey-portal` thread with `zbus::block_on`; one session per registration, since a session
-  binds only once; registers the host app ID first) and `x11::X11Backend` (`global-hotkey`, one
+  backend's thread). Backends: `portal::PortalBackend` (ashpd on a `hotkey-portal` thread with
+  `zbus::block_on`; one session per registration, since a session binds only once; registers the
+  host app ID first) and `x11::X11Backend` (`global-hotkey`, one
   process-wide event handler, so only one may exist; needs `$DISPLAY`).
   `Capabilities { assign_in_app, bind_hint }`: `portal::capabilities_for($XDG_CURRENT_DESKTOP)`
   gives Hyprland `BindHint::Hyprland`, whose `snippet` is the Lua bind line
@@ -182,7 +183,8 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   list every `HOTPLUG_POLL` (2 s); `midi::hotplug::plan` (pure) says what to connect/drop. Ports are
   matched by their stable name (`midir`'s name without the `client:port` address,
   `stable_port_name`). Triggers go to the `on_trigger` callback on the receiving MIDI thread;
-  `MidiEvent::{Ports, Connected, Error}` are polled by the UI (`wake` after each); errors are reported once until the same thing worked again.
+  `MidiEvent::{Ports, Connected, Error}` are polled by the UI (`wake` after each). Errors are
+  reported once until the same thing worked again.
 - `midi::message::Parser` (one per port): Note On with velocity > 0 triggers; CCs trigger on the
   rising edge across 64, tracked per channel + CC; everything else is ignored. Channels are 1–16.
 - `MidiBinding { port: Option<String>, channel, control }` on `SoundConfig::midi` and
@@ -190,8 +192,7 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   one config struct without `#[serde(default)]` (a binding without channel/control means nothing).
 - App side (`app/midi.rs`): `MidiState::learning` captures the next trigger instead of acting on
   it (`Action::Midi(MidiAction::Learn(..))`; closing the window or Esc cancels). Otherwise the
-  `triggers` thread plays it (see App architecture).
-  UI: `ui/midi_section.rs` (editor section, settings rows, shared learn widget).
+  `triggers` thread plays it (see App architecture). UI: `ui/midi_section.rs` (editor section, settings rows, shared learn widget).
 - `tests/midi_alsa.rs` needs `/dev/snd/seq` and runs only inside the container; it skips otherwise.
   The kernel sequencer isn't namespaced, so `in-container.sh` passes the host's through only with
   `SOUNDBOARS_HOST_MIDI=1` (the test then only touches its own virtual port). Agents: don't set it.
@@ -222,12 +223,20 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
 ## Tiling window managers
 
 winit doesn't set a parent for dialog windows on Wayland, so tiling compositors tile them. Users
-can float them by app ID (`me.maxjoehnk.soundboars`) and title, e.g. Hyprland 0.53–0.54 (the rule
-syntax changes between versions — see the wiki for yours):
+can float them by app ID (`me.maxjoehnk.soundboars`) and initial title. Hyprland ≥ 0.55 (Lua
+config, [wiki](https://wiki.hypr.land/0.57.0/configuring/core/rules/window-rules/); RE2 regex):
 
+```lua
+hl.window_rule({
+  match = {
+    class = [[^me\.maxjoehnk\.soundboars$]],
+    title = [[^(Settings|Edit sound.*|Add sound from URL)$]],
+  },
+  float = true,
+})
 ```
-windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|Edit sound.*|Add sound from URL)$, float on
-```
+
+Hyprland 0.53–0.54 (hyprlang): `windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|Edit sound.*|Add sound from URL)$, float on`
 
 ## Milestones
 
@@ -236,8 +245,8 @@ windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|E
 | 1 | Docker/CI harness + spike: inject stream, list recording apps, link into one; portal shortcut registration | done |
 | 2 | Audio engine: decoding + cache, both streams, voices, retrigger modes, volumes, limiter | done |
 | 3 | App UI: folder tabs, `notify`, config, target picker with auto-relink | done |
-| 4 | Hotkeys: trait, portal backend (with Hyprland bind hints), X11 backend | todo |
-| 5 | MIDI: midir, learn mode, hotplug | todo |
+| 4 | Hotkeys: trait, portal backend (with Hyprland bind hints), X11 backend | done |
+| 5 | MIDI: midir, learn mode, hotplug | done |
 | 6 | Trim editor: waveform peaks, non-destructive trim, preview | done |
-| 7 | URL import: yt-dlp runner, progress, errors → trim editor | todo |
+| 7 | URL import: yt-dlp runner, progress, errors → trim editor | done |
 | 8 | Polish: tray, multi-target, Opus, export trimmed copy | later |
