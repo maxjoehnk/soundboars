@@ -87,6 +87,11 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   sum both channels into one port (`link_plan::sums_channels`).
 - Decoding (`audio::decode`, symphonia + rubato) runs on the `sound-decoder` thread
   (`loader::SoundCache`); `invalidate` drops cached sounds and discards in-flight stale decodes.
+- Previews: `PlayRequest { destination: Destination::Preview, .. }` plays only on the local
+  stream (even with "Local" disabled), as one shared sound id with `Restart` retriggering, so a new
+  preview replaces the old one; `stop_preview()` stops it. `Playing::destination` tells previews
+  apart (the board ignores them). `load_waveform(path)` reuses the decode cache and computes
+  `audio::Waveform` (min/max peaks + length) on a short-lived thread → `EngineEvent::Waveform`.
 - Node details (app name, binary, media name) are not in registry globals; recording nodes are bound
   and their `info` (PROPS change only) is watched. Links are reconciled against a pure plan
   (`audio::link_plan`) on every graph change; a link lives as long as its proxy (`object.linger = false`).
@@ -97,13 +102,26 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   must have defaults; unknown fields are ignored). Per-sound data: `tabs[i].sounds["<file>"]`
   (`SoundConfig`, keyed by path relative to the tab folder). `$SOUNDBOARS_CONFIG` overrides the path.
 - `library`: tab = one folder, non-recursive, sorted by name; `watch::FolderWatcher` (impl
-  `NotifyWatcher`) reports `FolderEvent::{Listing, Contents}`.
+  `NotifyWatcher`) reports `FolderEvent::{Listing, Contents}`. `durations::DurationProbe` measures
+  every listed sound once on a background thread (`audio::decode::probe_duration`: container frame
+  count, full decode as fallback); tiles show the trimmed length (`SoundConfig::trimmed_length`).
 - `app`: `App` owns `AppState` (pure, unit-tested logic: visible sounds, play requests, progress)
   plus `Services` (`AudioBackend` = `AudioEngine` or a fake, `FolderWatcher`, `FolderPicker`,
   `ConfigStore`). Each frame: `poll()` services → `ui::draw(&AppState) -> Vec<Action>` → `apply()`
   → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
   and emits `Action`s; it never mutates state or calls services. Settings go through
   `Action::ChangeSetting(Setting)`. `app::targets::Targets` decides auto-relinking.
+- Dialogs are OS windows: `ui::dialog::Dialog { id, title, size }.show(ctx, |ui| …)` opens an
+  immediate viewport (app ID + icon set) and returns `true` when the user closed the window — treat
+  it as Cancel. Kittest embeds viewports as `egui::Window`s, so GUI tests work unchanged (a dialog's
+  window title is its label there). Size is fixed; adjust `size` when adding content.
+- "Edit sound" (`app/sound_editor.rs` state/logic, `app/ui/sound_editor.rs` drawing): opened by
+  `Action::EditSound(path)` (tile context menu; rescans the folder if the file isn't listed yet),
+  edits a copy (`AppState::editor`) via `Action::Editor(EditorAction)`, Save writes it into the
+  sound's `SoundConfig` with `SoundEditor::apply_to`. **Extension point:** `ui::sound_editor::body`
+  calls one function per section (`name_section`, `trim_section`, `volume_section`, …); a new
+  section adds one call there plus its own file, its fields to `SoundEditor` (+ `open`/`apply_to`)
+  and may emit its own `Action`s. Tile context menu items go into `ui::board::context_menu`.
 - New features: add an `Action` variant + `apply` arm, a module under `app/` for logic, and a file
   under `app/ui/` for drawing; keep edits to shared files (`app/mod.rs`, `app/ui/mod.rs`,
   `config.rs`) to small, additive insertions.
@@ -111,6 +129,16 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   accessible name or kittest fails). `tests/app_smoke.rs` runs the real binary on the container's
   Xvfb (wgpu on Mesa lavapipe). Icons in labels come from egui's bundled emoji fonts
   (`egui/monochrome_emoji_fonts`); kittest panics on glyphs no bundled font has.
+
+## Tiling window managers
+
+winit doesn't set a parent for dialog windows on Wayland, so tiling compositors tile them. Users
+can float them by app ID (`me.maxjoehnk.soundboars`) and title, e.g. Hyprland 0.53–0.54 (the rule
+syntax changes between versions — see the wiki for yours):
+
+```
+windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|Edit sound.*)$, float on
+```
 
 ## Milestones
 
@@ -121,6 +149,6 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
 | 3 | App UI: folder tabs, `notify`, config, target picker with auto-relink | done |
 | 4 | Hotkeys: trait, portal backend (with Hyprland bind hints), X11 backend | todo |
 | 5 | MIDI: midir, learn mode, hotplug | todo |
-| 6 | Trim editor: waveform peaks, non-destructive trim, preview | todo |
+| 6 | Trim editor: waveform peaks, non-destructive trim, preview | done |
 | 7 | URL import: yt-dlp runner, progress, errors → trim editor | todo |
 | 8 | Polish: tray, multi-target, Opus, export trimmed copy | later |
