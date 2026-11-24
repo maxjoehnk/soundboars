@@ -1,10 +1,12 @@
 //! Everything that talks to PipeWire: the graph model, the inject stream and the thread that owns
 //! them.
 
+pub mod decode;
 mod format;
 pub mod graph;
 mod inject;
 pub mod link_plan;
+pub mod loader;
 mod service;
 pub mod sine;
 

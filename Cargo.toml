@@ -10,6 +10,9 @@ publish = false
 [dependencies]
 bytemuck = "1"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
+rtrb = "0.4"
+rubato = "5"
+symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4"] }
 thiserror = "2"
 
 [dev-dependencies]
