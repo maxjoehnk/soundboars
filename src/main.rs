@@ -10,7 +10,7 @@ use soundboars::audio::AudioEngine;
 use soundboars::config::ConfigStore;
 use soundboars::import::ytdlp::YtDlp;
 use soundboars::library::watch::NotifyWatcher;
-use soundboars::midi::{HOTPLUG_POLL, MidiService, MidirInput};
+use soundboars::midi::MidirInput;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
@@ -22,13 +22,13 @@ fn main() -> anyhow::Result<()> {
 
     let config = ConfigStore::default_location()?;
     tracing::info!("config: {}", config.path().display());
-    let mut services = Services {
+    let services = Services {
         audio: start_audio(),
         watcher: Box::new(NotifyWatcher::new().context("could not watch folders")?),
         folder_picker: Box::new(PortalFolderPicker),
         hotkeys: Box::new(SystemHotkeys),
         config,
-        midi: None,
+        midi: Box::new(MidirInput::default()),
         downloader: Box::new(YtDlp::new()),
     };
     let icon = eframe::icon_data::from_png_bytes(ICON_PNG).context("invalid window icon")?;
@@ -43,10 +43,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "SoundBoars",
         options,
-        Box::new(|cc| {
-            services.midi = start_midi(&cc.egui_ctx);
-            Ok(Box::new(App::new(services)))
-        }),
+        Box::new(|cc| Ok(Box::new(App::new(services, &cc.egui_ctx)))),
     )
     .map_err(|error| anyhow::anyhow!("could not open the window: {error}"))
 }
@@ -60,13 +57,4 @@ fn start_audio() -> Result<Box<dyn AudioBackend>, String> {
             Err(error.to_string())
         }
     }
-}
-
-/// The MIDI thread, waking the UI for every trigger; `None` if it couldn't start.
-fn start_midi(ctx: &egui::Context) -> Option<MidiService> {
-    let ctx = ctx.clone();
-    let wake = move || ctx.request_repaint();
-    MidiService::start(Box::new(MidirInput::default()), HOTPLUG_POLL, wake)
-        .inspect_err(|error| tracing::error!("could not start MIDI: {error}"))
-        .ok()
 }

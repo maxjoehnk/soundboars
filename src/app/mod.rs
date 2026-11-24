@@ -1,6 +1,7 @@
 //! The application: [`App`] owns the state and the services, and runs the frame loop: poll the
 //! services, let [`ui`] draw the state and collect [`Action`]s, then apply them. Drawing never
-//! changes state or talks to services itself.
+//! changes state or talks to services itself. Hotkeys and MIDI triggers play without frames, on
+//! the `triggers` thread ([`Dispatcher`]).
 
 mod hotkeys;
 mod midi;
@@ -8,11 +9,12 @@ mod services;
 mod sound_editor;
 mod state;
 mod targets;
+mod triggers;
 mod ui;
 mod url_import;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use eframe::egui;
@@ -24,14 +26,17 @@ use crate::hotkeys::{BackendKind, Hotkey};
 use crate::import::{DownloadEvent, Downloader};
 use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
-use crate::midi::{MidiEvent, MidiService, MidiTrigger};
+use crate::midi::{HOTPLUG_POLL, MidiEvent, MidiInput, MidiService, MidiTrigger};
 
 pub use hotkeys::STOP_ALL_ID;
 pub use midi::{LearnTarget, MidiAction, MidiState};
-pub use services::{AudioBackend, FolderPicker, HotkeyBackends, PortalFolderPicker, SystemHotkeys};
+pub use services::{
+    AudioBackend, FolderPicker, HotkeyBackends, Player, PortalFolderPicker, SystemHotkeys,
+};
 pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
 pub use targets::{NO_APPS_HINT, Targets};
+use triggers::{Dispatcher, Trigger};
 pub use url_import::{ImportStatus, UrlImport, UrlImportAction};
 
 /// The app ID of all windows (Wayland app ID, X11 class), and the portal's and `.desktop` file's.
@@ -118,8 +123,7 @@ pub struct Services {
     pub folder_picker: Box<dyn FolderPicker>,
     pub config: ConfigStore,
     pub hotkeys: Box<dyn HotkeyBackends>,
-    /// `None` if its thread couldn't start.
-    pub midi: Option<MidiService>,
+    pub midi: Box<dyn MidiInput>,
     pub downloader: Box<dyn Downloader>,
 }
 
@@ -128,7 +132,10 @@ pub struct App {
     audio: Option<Box<dyn AudioBackend>>,
     watcher: Box<dyn FolderWatcher>,
     folder_picker: Box<dyn FolderPicker>,
+    /// `None` if its thread couldn't start.
     midi: Option<MidiService>,
+    /// Plays hotkeys and MIDI triggers; `None` if its thread couldn't start.
+    triggers: Option<Dispatcher>,
     picked_folders: (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>),
     store: ConfigStore,
     downloader: Box<dyn Downloader>,
@@ -138,14 +145,13 @@ pub struct App {
     unsaved: bool,
     applied_theme: Option<Theme>,
     hotkeys: hotkeys::Hotkeys,
-    /// For hotkey backends to wake the UI; set on the first frame.
-    repaint: Arc<OnceLock<egui::Context>>,
 }
 
 impl App {
-    /// Loads the config, scans and watches the tab folders and applies the settings to the audio
-    /// engine.
-    pub fn new(services: Services) -> Self {
+    /// Loads the config, scans and watches the tab folders, applies the settings to the audio
+    /// engine and starts handling hotkeys and MIDI. Background threads wake `ctx` when there is
+    /// something new to show.
+    pub fn new(services: Services, ctx: &egui::Context) -> Self {
         let (config, config_error) = services.config.load();
         let mut state = AppState::new(config);
         state.url_import_unavailable = services.downloader.unavailable();
@@ -162,19 +168,25 @@ impl App {
                 None
             }
         };
-        let repaint = Arc::new(OnceLock::<egui::Context>::new());
-        let wake = repaint.clone();
-        let hotkeys = hotkeys::Hotkeys::new(services.hotkeys, move || {
-            if let Some(ctx) = wake.get() {
-                ctx.request_repaint();
-            }
-        });
+        let ctx = ctx.clone();
+        let wake = move || ctx.request_repaint();
+        let (trigger_tx, trigger_rx) = mpsc::channel();
+        let player = audio.as_ref().map(|audio| audio.player());
+        let triggers = Dispatcher::start(trigger_rx, player, wake.clone())
+            .inspect_err(|error| {
+                state
+                    .errors
+                    .push(format!("Hotkeys and MIDI can't play sounds: {error}"));
+            })
+            .ok();
+        let hotkeys = hotkeys::Hotkeys::new(services.hotkeys, trigger_tx.clone(), wake.clone());
         let mut app = Self {
             state,
             audio,
             watcher: services.watcher,
             folder_picker: services.folder_picker,
-            midi: services.midi,
+            midi: start_midi(services.midi, trigger_tx, wake),
+            triggers,
             picked_folders: mpsc::channel(),
             store: services.config,
             downloader: services.downloader,
@@ -182,13 +194,13 @@ impl App {
             unsaved: false,
             applied_theme: None,
             hotkeys,
-            repaint,
         };
         app.watch_tabs();
         app.measure_sounds();
         app.apply_settings();
         app.sync_hotkeys();
         app.select_midi_input();
+        app.sync_triggers();
         for error in &app.state.errors {
             tracing::warn!("{error}");
         }
@@ -218,8 +230,12 @@ impl App {
         while let Ok(folder) = self.picked_folders.1.try_recv() {
             self.add_tab(folder);
         }
-        for outcome in self.hotkeys.poll() {
-            self.hotkey_outcome(outcome);
+        for error in self.hotkeys.errors() {
+            self.show_error(error);
+        }
+        let learned = self.triggers.as_ref().map(Dispatcher::learned);
+        for trigger in learned.into_iter().flatten() {
+            self.midi_learned(&trigger);
         }
         for event in self.downloader.poll() {
             self.download_event(event);
@@ -233,6 +249,7 @@ impl App {
                 Err(error) => tracing::debug!("no length for {}: {error}", path.display()),
             }
         }
+        self.sync_triggers();
     }
 
     pub fn apply(&mut self, action: Action) {
@@ -272,6 +289,15 @@ impl App {
             Action::RecordStopAllHotkey(recording) => self.state.recording_stop_all = recording,
         }
         self.sync_hotkeys();
+        self.sync_triggers();
+    }
+
+    /// Tells the `triggers` thread what hotkeys and MIDI triggers do now. Cheap enough to do after
+    /// every change: it only resolves the bound sounds.
+    fn sync_triggers(&self) {
+        if let Some(triggers) = &self.triggers {
+            triggers.set_table(self.state.trigger_table());
+        }
     }
 
     /// Starts the chosen hotkey backend and registers the config's bindings, if either changed.
@@ -281,16 +307,6 @@ impl App {
             self.show_error(error);
         }
         self.state.hotkey_capabilities = self.hotkeys.capabilities();
-    }
-
-    fn hotkey_outcome(&mut self, outcome: hotkeys::Outcome) {
-        match outcome {
-            hotkeys::Outcome::Triggered(hotkeys::Target::Play(path)) => {
-                self.apply(Action::Play(path));
-            }
-            hotkeys::Outcome::Triggered(hotkeys::Target::StopAll) => self.apply(Action::StopAll),
-            hotkeys::Outcome::Error(error) => self.show_error(error),
-        }
     }
 
     /// Saves the config if it changed, but not while a button is held (e.g. while dragging a
@@ -450,13 +466,13 @@ impl App {
         match event {
             MidiEvent::Ports(ports) => self.state.midi.ports = ports,
             MidiEvent::Connected(ports) => self.state.midi.connected = ports,
-            MidiEvent::Trigger(trigger) => self.midi_trigger(&trigger),
             MidiEvent::Error(message) => self.show_error(message),
         }
     }
 
-    /// Learns the trigger while learning, else acts on it like a click would.
-    fn midi_trigger(&mut self, trigger: &MidiTrigger) {
+    /// Learns a trigger the `triggers` thread captured while learning. Ignored if learning was
+    /// cancelled since.
+    fn midi_learned(&mut self, trigger: &MidiTrigger) {
         match self.state.midi.learn(trigger) {
             Some((LearnTarget::Sound, binding)) => {
                 if let Some(editor) = &mut self.state.editor {
@@ -467,11 +483,7 @@ impl App {
                 self.state.config.settings.midi_stop_all = Some(binding);
                 self.unsaved = true;
             }
-            None => {
-                for action in self.state.midi_actions(trigger) {
-                    self.apply(action);
-                }
-            }
+            None => {}
         }
     }
 
@@ -653,6 +665,21 @@ impl App {
     }
 }
 
+/// The MIDI thread, sending its triggers to `triggers`; `None` if it couldn't start.
+fn start_midi(
+    input: Box<dyn MidiInput>,
+    triggers: mpsc::Sender<Trigger>,
+    wake: impl Fn() + Send + Sync + 'static,
+) -> Option<MidiService> {
+    let on_trigger = move |trigger| {
+        // Fails only when the app is gone.
+        let _ = triggers.send(Trigger::Midi(trigger));
+    };
+    MidiService::start(input, HOTPLUG_POLL, wake, on_trigger)
+        .inspect_err(|error| tracing::error!("could not start MIDI: {error}"))
+        .ok()
+}
+
 fn start_duration_probe() -> Option<DurationProbe> {
     DurationProbe::start(probe_duration)
         .inspect_err(|error| tracing::error!("could not start measuring sounds: {error}"))
@@ -662,7 +689,6 @@ fn start_duration_probe() -> Option<DurationProbe> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.repaint.get_or_init(|| ctx.clone());
         self.poll();
         self.apply_theme(&ctx);
         let actions = ui::draw(ui, &self.state);

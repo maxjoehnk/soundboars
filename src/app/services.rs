@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::audio::{AudioEngine, EngineEvent, PlayRequest, Playing, Retrigger};
+use crate::audio::{AudioEngine, EngineEvent, PlayHandle, PlayRequest, Playing, Retrigger};
 use crate::hotkeys::{self, BackendKind, EventSink, HotkeyBackend};
 
 /// What the UI needs from [`AudioEngine`]. Every call returns right away.
@@ -24,6 +24,24 @@ pub trait AudioBackend {
     /// The events since the last call.
     fn poll_events(&self) -> Vec<EngineEvent>;
     fn playing(&self) -> Vec<Playing>;
+    /// Plays and stops sounds from the thread that handles hotkeys and MIDI.
+    fn player(&self) -> Box<dyn Player>;
+}
+
+/// What hotkeys and MIDI triggers need from the audio engine, from their own thread.
+pub trait Player: Send {
+    fn play(&self, request: PlayRequest);
+    fn stop_all(&self);
+}
+
+impl Player for PlayHandle {
+    fn play(&self, request: PlayRequest) {
+        PlayHandle::play(self, request);
+    }
+
+    fn stop_all(&self) {
+        PlayHandle::stop_all(self);
+    }
 }
 
 impl AudioBackend for AudioEngine {
@@ -77,6 +95,10 @@ impl AudioBackend for AudioEngine {
 
     fn playing(&self) -> Vec<Playing> {
         AudioEngine::playing(self)
+    }
+
+    fn player(&self) -> Box<dyn Player> {
+        Box::new(self.play_handle())
     }
 }
 

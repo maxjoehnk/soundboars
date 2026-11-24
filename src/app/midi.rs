@@ -1,10 +1,10 @@
-//! MIDI in the app: learning bindings and turning triggers into the actions a click would cause.
+//! MIDI in the app: learning bindings (what triggers do is in [`super::triggers`]).
 
 use std::path::Path;
 
 use crate::midi::{MidiBinding, MidiDevice, MidiTrigger};
 
-use super::{Action, AppState};
+use super::AppState;
 
 /// What the next trigger is learned for while learning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub enum LearnTarget {
     StopAll,
 }
 
-/// What the user did about MIDI (see [`Action::Midi`]).
+/// What the user did about MIDI (see [`Action::Midi`](super::Action::Midi)).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MidiAction {
     SelectInput(MidiDevice),
@@ -49,21 +49,6 @@ impl MidiState {
 }
 
 impl AppState {
-    /// What a trigger does (when not learning): "Stop all" if bound to it, then play every sound
-    /// bound to it.
-    pub fn midi_actions(&self, trigger: &MidiTrigger) -> Vec<Action> {
-        let stop_all = self.config.settings.midi_stop_all.as_ref();
-        let stop = stop_all.is_some_and(|binding| binding.matches(trigger));
-        let plays = self
-            .bound_sounds()
-            .filter(|(_, binding)| binding.matches(trigger))
-            .map(|(path, _)| Action::Play(path.to_owned()));
-        stop.then_some(Action::StopAll)
-            .into_iter()
-            .chain(plays)
-            .collect()
-    }
-
     /// The names of the sounds, other than the one at `except`, that a trigger of `binding` would
     /// play as well.
     pub fn sounds_bound_like(&self, binding: &MidiBinding, except: Option<&Path>) -> Vec<String> {
@@ -75,7 +60,7 @@ impl AppState {
     }
 
     /// Every sound in the library that has a MIDI binding.
-    fn bound_sounds(&self) -> impl Iterator<Item = (&Path, &MidiBinding)> {
+    pub(super) fn bound_sounds(&self) -> impl Iterator<Item = (&Path, &MidiBinding)> {
         let folders = self.library.folders().iter().zip(&self.config.tabs);
         folders.flat_map(|(folder, tab)| {
             folder.sounds.iter().filter_map(|sound| {
@@ -158,45 +143,6 @@ mod tests {
             state: AppState::new(config),
             dir,
         }
-    }
-
-    #[test]
-    fn triggers_play_every_sound_bound_to_them() {
-        let f = fixture();
-        assert_eq!(
-            f.state.midi_actions(&trigger(MidiControl::Note(36))),
-            [
-                Action::Play(f.path("Airhorn.wav")),
-                Action::Play(f.path("Bruh.wav"))
-            ]
-        );
-        let elsewhere = MidiTrigger {
-            port: "BeatStep:BeatStep MIDI 1".to_owned(),
-            ..trigger(MidiControl::Note(36))
-        };
-        assert_eq!(
-            f.state.midi_actions(&elsewhere),
-            [Action::Play(f.path("Bruh.wav"))]
-        );
-        assert_eq!(
-            f.state
-                .midi_actions(&trigger(MidiControl::ControlChange(20))),
-            [Action::Play(f.path("Horn.wav"))]
-        );
-        assert!(
-            f.state
-                .midi_actions(&trigger(MidiControl::Note(1)))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn the_stop_all_binding_stops_all() {
-        let f = fixture();
-        assert_eq!(
-            f.state.midi_actions(&trigger(MidiControl::Note(40))),
-            [Action::StopAll]
-        );
     }
 
     #[test]

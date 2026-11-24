@@ -16,7 +16,7 @@ pub mod sine;
 pub mod waveform;
 
 pub use controller::{Destination, EngineEvent, PlayRequest, Playing, Trim};
-pub use engine::AudioEngine;
+pub use engine::{AudioEngine, PlayHandle};
 pub use format::{CHANNELS, SAMPLE_RATE};
 pub use graph::{Port, RecordingApp};
 pub use mixer::{Retrigger, VoiceId};

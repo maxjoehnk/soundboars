@@ -35,27 +35,26 @@ pub enum HotkeyEvent {
     Error(String),
 }
 
-/// Where backends send their events: a channel, plus a wake-up call so the UI handles them even
-/// while it idles in the background.
+/// Where backends send their events (from their own threads), e.g. presses to the app's trigger
+/// thread and errors to the UI.
 #[derive(Clone)]
-pub struct EventSink {
-    sender: mpsc::Sender<HotkeyEvent>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-}
+pub struct EventSink(Arc<dyn Fn(HotkeyEvent) + Send + Sync>);
 
 impl EventSink {
-    pub fn new(sender: mpsc::Sender<HotkeyEvent>, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self {
-            sender,
-            wake: Arc::new(wake),
-        }
+    pub fn new(on_event: impl Fn(HotkeyEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(on_event))
+    }
+
+    /// A sink that sends every event to `sender`.
+    pub fn channel(sender: mpsc::Sender<HotkeyEvent>) -> Self {
+        // Fails only when the receiver is gone, and then nobody is interested anymore.
+        Self::new(move |event| {
+            let _ = sender.send(event);
+        })
     }
 
     pub fn send(&self, event: HotkeyEvent) {
-        // Fails only when the app is gone.
-        if self.sender.send(event).is_ok() {
-            (self.wake)();
-        }
+        (self.0)(event);
     }
 }
 
@@ -177,16 +176,17 @@ mod tests {
     }
 
     #[test]
-    fn the_sink_wakes_the_ui_for_every_event() {
+    fn the_channel_sink_sends_every_event() {
         let (sender, events) = mpsc::channel();
-        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = wakes.clone();
-        let sink = EventSink::new(sender, move || {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        });
+        let sink = EventSink::channel(sender);
         sink.send(HotkeyEvent::Pressed("a".to_owned()));
         sink.send(HotkeyEvent::Released("a".to_owned()));
-        assert_eq!(events.try_iter().count(), 2);
-        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            [
+                HotkeyEvent::Pressed("a".to_owned()),
+                HotkeyEvent::Released("a".to_owned())
+            ]
+        );
     }
 }

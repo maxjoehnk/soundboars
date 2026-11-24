@@ -10,7 +10,7 @@ use eframe::egui::accesskit::Role;
 use eframe::egui::{Key, Modifiers, Pos2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
-use soundboars::app::{App, AudioBackend, FolderPicker, HotkeyBackends, Services};
+use soundboars::app::{App, AudioBackend, FolderPicker, HotkeyBackends, Player, Services};
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
@@ -21,8 +21,7 @@ use soundboars::hotkeys::{
 use soundboars::import::{DownloadEvent, Downloader, Stage};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
 use soundboars::midi::{
-    Connection, HOTPLUG_POLL, MidiBinding, MidiControl, MidiDevice, MidiError, MidiInput, MidiPort,
-    MidiService, OnMessage,
+    Connection, MidiBinding, MidiControl, MidiDevice, MidiError, MidiInput, MidiPort, OnMessage,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +128,18 @@ impl AudioBackend for FakeAudio {
     }
     fn playing(&self) -> Vec<Playing> {
         self.0.with(|world| world.playing.clone())
+    }
+    fn player(&self) -> Box<dyn Player> {
+        Box::new(FakeAudio(self.0.clone()))
+    }
+}
+
+impl Player for FakeAudio {
+    fn play(&self, request: PlayRequest) {
+        self.0.call(Call::Play(request));
+    }
+    fn stop_all(&self) {
+        self.0.call(Call::StopAll);
     }
 }
 
@@ -324,24 +335,18 @@ impl Setup {
         &self,
         audio: Result<Box<dyn AudioBackend>, String>,
     ) -> Harness<'static, App> {
-        let mut services = Services {
+        let services = Services {
             audio,
             watcher: Box::new(FakeWatcher(self.shared.clone())),
             folder_picker: Box::new(FakePicker(self.shared.clone())),
             config: self.store.clone(),
             hotkeys: Box::new(FakeHotkeys(self.shared.clone())),
-            midi: None,
+            midi: Box::new(self.midi.clone()),
             downloader: Box::new(FakeDownloader(self.shared.clone())),
         };
-        let midi = Box::new(self.midi.clone());
         let mut harness = Harness::builder()
             .with_size([1000.0, 700.0])
-            .build_eframe(|cc| {
-                let ctx = cc.egui_ctx.clone();
-                let wake = move || ctx.request_repaint();
-                services.midi = Some(MidiService::start(midi, HOTPLUG_POLL, wake).expect("thread"));
-                App::new(services)
-            });
+            .build_eframe(|cc| App::new(services, &cc.egui_ctx));
         harness.run();
         harness
     }
@@ -1034,14 +1039,52 @@ fn registered(setup: &Setup) -> Vec<Binding> {
         .with(|world| world.registered.last().cloned().unwrap_or_default())
 }
 
-/// The backend reports a hotkey event.
+/// The backend reports a hotkey event, and the app runs a frame.
 fn hotkey_event(setup: &Setup, harness: &mut Harness<'_, App>, event: HotkeyEvent) {
+    report_hotkey(setup, event);
+    harness.run();
+}
+
+/// The backend reports a hotkey event (from its own thread, in the real app).
+fn report_hotkey(setup: &Setup, event: HotkeyEvent) {
     let events = setup
         .shared
         .with(|world| world.hotkey_events.clone())
         .expect("a hotkey backend runs");
     events.send(event);
+}
+
+/// Waits until `done`, without running frames.
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Runs frames until `done`. Hotkeys and MIDI triggers are handled on their own thread, so what
+/// they do shows up a moment later.
+fn run_until(harness: &mut Harness<'_, App>, what: &str, done: impl Fn(&Harness<'_, App>) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
     harness.run();
+    while !done(harness) {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run();
+    }
+}
+
+fn airhorn_request(setup: &Setup) -> PlayRequest {
+    PlayRequest {
+        path: airhorn(setup),
+        trim: Some(Trim {
+            start_ms: 100,
+            end_ms: Some(900),
+        }),
+        volume: 0.5,
+        destination: Destination::Everywhere,
+    }
 }
 
 /// Airhorn has the hotkey Ctrl+F13 and the shortcut id `play-airhorn`.
@@ -1221,21 +1264,30 @@ fn hotkey_presses_play_sounds_and_stop_all() {
         HotkeyEvent::Pressed("stop-all".into()),
     );
 
+    // Presses are handled in order, so once "Stop all" arrived, the others were handled too.
+    run_until(&mut harness, "Stop all", |_| {
+        setup.shared.calls().contains(&Call::StopAll)
+    });
     assert_eq!(
         setup.shared.calls(),
-        [
-            Call::Play(PlayRequest {
-                path: airhorn(&setup),
-                trim: Some(Trim {
-                    start_ms: 100,
-                    end_ms: Some(900),
-                }),
-                volume: 0.5,
-                destination: Destination::Everywhere,
-            }),
-            Call::StopAll,
-        ]
+        [Call::Play(airhorn_request(&setup)), Call::StopAll]
     );
+}
+
+#[test]
+fn hotkeys_play_while_the_window_gets_no_frames() {
+    let setup = setup_with_airhorn_hotkey();
+    let _harness = setup.start();
+    setup.shared.clear_calls();
+
+    // No `harness.run()` from here on: a hidden window on Wayland may get no frames.
+    report_hotkey(&setup, HotkeyEvent::Pressed("play-airhorn".into()));
+    wait_for("the play", || !setup.shared.calls().is_empty());
+    assert_eq!(setup.shared.calls(), [Call::Play(airhorn_request(&setup))]);
+
+    report_hotkey(&setup, HotkeyEvent::Pressed("stop-all".into()));
+    wait_for("Stop all", || setup.shared.calls().len() == 2);
+    assert_eq!(setup.shared.calls()[1], Call::StopAll);
 }
 
 #[test]
@@ -1360,8 +1412,16 @@ fn note_36(port: Option<&str>) -> MidiBinding {
     }
 }
 
-/// Sends a message from the MPD218 once the app listens to it, and lets the app handle it.
+/// Sends a message from the MPD218 once the app listens to it, and runs a frame. What the message
+/// triggers happens on the `triggers` thread, so check its effects with [`run_until`].
 fn send_midi(setup: &Setup, harness: &mut Harness<'_, App>, message: &[u8]) {
+    midi_message(setup, message);
+    harness.run();
+}
+
+/// Sends a message from the MPD218 once the app listens to it. The MIDI thread connects on its
+/// own, so this doesn't run frames.
+fn midi_message(setup: &Setup, message: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let sent = setup.midi.with(|world| {
@@ -1371,16 +1431,14 @@ fn send_midi(setup: &Setup, harness: &mut Harness<'_, App>, message: &[u8]) {
                 .is_some()
         });
         if sent {
-            break;
+            return;
         }
         assert!(
             Instant::now() < deadline,
             "the app never connected to the MPD218"
         );
         std::thread::sleep(Duration::from_millis(10));
-        harness.run();
     }
-    harness.run();
 }
 
 fn plays(setup: &Setup) -> Vec<PathBuf> {
@@ -1404,9 +1462,11 @@ fn a_note_learned_in_the_editor_is_saved_and_shown_on_the_tile() {
     click_editor_button(&mut harness, "Learn");
     assert!(harness.query_by_label("Cancel learning").is_some());
     send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+    run_until(&mut harness, "the learned note", |harness| {
+        harness.query_by_label("Cancel learning").is_none()
+    });
 
     assert!(plays(&setup).is_empty(), "learning doesn't play");
-    assert!(harness.query_by_label("Cancel learning").is_none());
     assert!(harness.query_by_label("Note 36 · ch 1 · MPD218").is_some());
     click_editor_button(&mut harness, "Save");
 
@@ -1426,21 +1486,27 @@ fn a_bound_trigger_plays_the_sound_like_a_click() {
 
     send_midi(&setup, &mut harness, &[0x80, 36, 0]);
     send_midi(&setup, &mut harness, &[0x90, 37, 100]);
-    assert!(setup.shared.calls().is_empty());
     send_midi(&setup, &mut harness, &[0x90, 36, 100]);
 
-    assert_eq!(
-        setup.shared.calls(),
-        [Call::Play(PlayRequest {
-            path: airhorn(&setup),
-            trim: Some(Trim {
-                start_ms: 100,
-                end_ms: Some(900)
-            }),
-            volume: 0.5,
-            destination: Destination::Everywhere,
-        })]
-    );
+    // Triggers are handled in order: once note 36 played, the others did nothing.
+    run_until(&mut harness, "the play", |_| !plays(&setup).is_empty());
+    assert_eq!(setup.shared.calls(), [Call::Play(airhorn_request(&setup))]);
+}
+
+#[test]
+fn midi_triggers_play_while_the_window_gets_no_frames() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let _harness = setup.start();
+    setup.shared.clear_calls();
+
+    // No `harness.run()` from here on: a hidden window on Wayland may get no frames.
+    midi_message(&setup, &[0x90, 36, 100]);
+    wait_for("the play", || !setup.shared.calls().is_empty());
+    assert_eq!(setup.shared.calls(), [Call::Play(airhorn_request(&setup))]);
 }
 
 #[test]
@@ -1464,6 +1530,7 @@ fn learning_can_be_cancelled_with_escape() {
     assert!(harness.query_by_label("Cancel learning").is_none());
 
     send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+    run_until(&mut harness, "the play", |_| !plays(&setup).is_empty());
     assert_eq!(plays(&setup), [setup.folder("Memes").join("Bruh.wav")]);
     assert!(harness.query_by_label("—").is_some(), "not bound");
 }
@@ -1519,7 +1586,9 @@ fn learning_a_binding_another_sound_uses_warns() {
     click_editor_button(&mut harness, "Learn");
     send_midi(&setup, &mut harness, &[0x90, 36, 100]);
 
-    assert!(harness.query_by_label("⚠ Also triggers: Horn").is_some());
+    run_until(&mut harness, "the warning", |harness| {
+        harness.query_by_label("⚠ Also triggers: Horn").is_some()
+    });
     click_editor_button(&mut harness, "Save");
     assert_eq!(saved_airhorn(&setup).midi, Some(note_36(Some(MPD))));
 }
@@ -1565,6 +1634,9 @@ fn stop_all_can_be_learned_in_the_settings() {
     harness.get_by_label("Learn").click();
     harness.run();
     send_midi(&setup, &mut harness, &[0xB0, 20, 127]);
+    run_until(&mut harness, "the learned CC", |_| {
+        setup.config().settings.midi_stop_all.is_some()
+    });
 
     assert!(setup.shared.calls().is_empty(), "learning doesn't stop");
     let learned = MidiBinding {
@@ -1577,6 +1649,9 @@ fn stop_all_can_be_learned_in_the_settings() {
 
     send_midi(&setup, &mut harness, &[0xB0, 20, 0]);
     send_midi(&setup, &mut harness, &[0xB0, 20, 127]);
+    run_until(&mut harness, "Stop all", |_| {
+        !setup.shared.calls().is_empty()
+    });
     assert_eq!(setup.shared.calls(), [Call::StopAll]);
 
     harness.get_by_label("Clear").click();

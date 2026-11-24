@@ -1,5 +1,6 @@
 //! The `midi` thread: follows the "MIDI input" setting and the ports coming and going, and keeps
-//! the wanted ports connected. Triggers are sent straight from the MIDI threads that receive them.
+//! the wanted ports connected. Triggers go to a callback straight from the MIDI threads that
+//! receive them; everything else is a [`MidiEvent`] for the UI.
 
 use std::collections::HashSet;
 use std::io;
@@ -21,13 +22,15 @@ pub enum MidiEvent {
     Ports(Vec<String>),
     /// The names of the ports listened to, whenever that changes.
     Connected(Vec<String>),
-    Trigger(MidiTrigger),
     /// Reported once; again only after the same thing worked in between.
     Error(String),
 }
 
 /// Wakes the UI so it handles new events right away, even while idle or unfocused.
 type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Called with every trigger, on the MIDI thread that received it.
+type OnTrigger = Arc<dyn Fn(MidiTrigger) + Send + Sync>;
 
 /// The app's handle on the `midi` thread. Every call returns right away; dropping it stops the
 /// thread, which closes the connections.
@@ -38,11 +41,12 @@ pub struct MidiService {
 
 impl MidiService {
     /// Starts with MIDI [off](MidiDevice::Off) until [`Self::select`] is called. `wake` is called
-    /// after every event.
+    /// after every event, `on_trigger` with every trigger.
     pub fn start(
         input: Box<dyn MidiInput>,
         poll_interval: Duration,
         wake: impl Fn() + Send + Sync + 'static,
+        on_trigger: impl Fn(MidiTrigger) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         let (devices, device_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
@@ -50,6 +54,7 @@ impl MidiService {
             input,
             events: event_tx,
             wake: Arc::new(wake),
+            on_trigger: Arc::new(on_trigger),
             connections: Vec::new(),
             ports: None,
             connected: Vec::new(),
@@ -89,6 +94,7 @@ struct Scanner {
     input: Box<dyn MidiInput>,
     events: mpsc::Sender<MidiEvent>,
     wake: Wake,
+    on_trigger: OnTrigger,
     connections: Vec<(MidiPort, Connection)>,
     /// What was reported last.
     ports: Option<Vec<String>>,
@@ -135,16 +141,13 @@ impl Scanner {
         }
     }
 
-    /// Parses the port's messages and sends the triggers.
+    /// Parses the port's messages and hands on the triggers.
     fn on_message(&self, port: &MidiPort) -> super::OnMessage {
         let mut parser = Parser::new(port.name.clone());
-        let events = self.events.clone();
-        let wake = Arc::clone(&self.wake);
+        let on_trigger = Arc::clone(&self.on_trigger);
         Box::new(move |message| {
-            if let Some(trigger) = parser.parse(message)
-                && events.send(MidiEvent::Trigger(trigger)).is_ok()
-            {
-                wake();
+            if let Some(trigger) = parser.parse(message) {
+                on_trigger(trigger);
             }
         })
     }
@@ -292,7 +295,14 @@ mod tests {
     }
 
     fn start(fake: &Fake) -> MidiService {
-        MidiService::start(Box::new(fake.clone()), POLL, || {}).expect("thread starts")
+        start_with_triggers(fake, |_| {})
+    }
+
+    fn start_with_triggers(
+        fake: &Fake,
+        on_trigger: impl Fn(MidiTrigger) + Send + Sync + 'static,
+    ) -> MidiService {
+        MidiService::start(Box::new(fake.clone()), POLL, || {}, on_trigger).expect("thread starts")
     }
 
     /// Collects events until one satisfies `done`; returns all of them.
@@ -319,7 +329,10 @@ mod tests {
     fn listens_to_the_selected_port_and_sends_its_triggers() {
         let fake = Fake::default();
         fake.with(|world| world.ports = vec![port("20:0", "MPD"), port("24:0", "BeatStep")]);
-        let service = start(&fake);
+        let (triggers, received) = mpsc::channel();
+        let service = start_with_triggers(&fake, move |trigger| {
+            let _ = triggers.send(trigger);
+        });
         service.select(MidiDevice::Port("MPD".to_owned()));
 
         let events = events_until(&service, |event| *event == connected(&["MPD"]));
@@ -334,14 +347,14 @@ mod tests {
 
         fake.send("20:0", &[0x80, 36, 0]);
         fake.send("20:0", &[0x90, 36, 100]);
-        let events = events_until(&service, |event| matches!(event, MidiEvent::Trigger(_)));
         assert_eq!(
-            events,
-            [MidiEvent::Trigger(MidiTrigger {
+            received.try_iter().collect::<Vec<_>>(),
+            [MidiTrigger {
                 port: "MPD".to_owned(),
                 channel: 1,
                 control: MidiControl::Note(36),
-            })]
+            }],
+            "triggers are handed on synchronously, on the MIDI thread"
         );
     }
 

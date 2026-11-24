@@ -73,7 +73,8 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
 
 ## Audio threading
 
-- `audio::AudioEngine` is the app's API (`Send`, every call non-blocking, results as `EngineEvent`s).
+- `audio::AudioEngine` is the app's API (`Send`, every call non-blocking, results as `EngineEvent`s;
+  `play_handle()` gives a cloneable `Send + Sync` `PlayHandle` for play/stop-all from other threads).
   It runs an `audio-control` thread owning the `Controller` (sound cache, mixer handles, what's
   playing); everything reaches it as `controller::Message`s on one `mpsc` channel (façade calls,
   PipeWire events, decode results). It polls the mixers every 10 ms only while voices play.
@@ -107,11 +108,19 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   count, full decode as fallback); tiles show the trimmed length (`SoundConfig::trimmed_length`).
 - `app`: `App` owns `AppState` (pure, unit-tested logic: visible sounds, play requests, progress)
   plus `Services` (`AudioBackend` = `AudioEngine` or a fake, `FolderWatcher`, `FolderPicker`,
-  `ConfigStore`, `Downloader`, `MidiService` — the latter started in eframe's creator closure, as
-  it needs the `egui::Context` to wake the UI). Each frame: `poll()` services → `ui::draw(&AppState)
+  `ConfigStore`, `Downloader`, `HotkeyBackends`, `MidiInput`). `App::new(services, ctx)` starts the
+  background threads with `ctx.request_repaint` as their wake-up. Each frame: `poll()` services → `ui::draw(&AppState)
   -> Vec<Action>` → `apply()` → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
   and emits `Action`s; it never mutates state or calls services. Settings go through
   `Action::ChangeSetting(Setting)`. `app::targets::Targets` decides auto-relinking.
+- Hotkeys and MIDI triggers don't go through the frame loop (a hidden Wayland window may get no
+  frames): `app::triggers::Dispatcher` runs a `triggers` thread that receives `Trigger::{Hotkey(id),
+  Midi(..)}` from the hotkey `EventSink` and the MIDI `on_trigger` callback, resolves them against a
+  `TriggerTable` (`Arc<RwLock<…>>`) and calls `AudioBackend::player()` (`Player`: play/stop all)
+  directly, then wakes the UI. `AppState::trigger_table()` (pure, unit-tested) maps shortcut ids and
+  MIDI bindings to resolved `PlayRequest`s or StopAll; the app rebuilds it after every `apply` and
+  `poll`. While a MIDI binding is learned, MIDI triggers go back to the UI (`Dispatcher::learned`);
+  while a hotkey is recorded, global shortcut presses do nothing.
 - Dialogs are OS windows: `ui::dialog::Dialog { id, title, size }.show(ctx, |ui| …)` opens an
   immediate viewport (app ID + icon set) and returns `true` when the user closed the window — treat
   it as Cancel. Kittest embeds viewports as `egui::Window`s, so GUI tests work unchanged (a dialog's
@@ -140,8 +149,8 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   (`CTRL+SHIFT+F13`) and Hyprland key (`CTRL + SHIFT + F13`) formats. egui doesn't report Super on
   Linux, so Super can only be typed into the config.
 - `trait HotkeyBackend { register(&[Binding]), capabilities() }`: `register` replaces the whole set.
-  Events (`Pressed(id)`, `Released(id)`, `Error`) go through an `EventSink` (mpsc + a wake-up that
-  calls `egui::Context::request_repaint`). Backends: `portal::PortalBackend` (ashpd on a
+  Events (`Pressed(id)`, `Released(id)`, `Error`) go to an `EventSink` (a callback, called on the
+  backend's thread). Backends: `portal::PortalBackend` (ashpd on a
   `hotkey-portal` thread with `zbus::block_on`; one session per registration, since a session
   binds only once; registers the host app ID first) and `x11::X11Backend` (`global-hotkey`, one
   process-wide event handler, so only one may exist; needs `$DISPLAY`).
@@ -156,12 +165,11 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   type them into their compositor config); removing and re-adding keeps the saved id.
 - `app::hotkeys::Hotkeys` owns the backend: `App::apply` ends with `sync_hotkeys()`, which restarts
   the backend when `AppState::hotkey_backend()` (setting, else portal on Wayland / X11) changed and
-  re-registers when the binding set changed. Presses become `Action::Play` / `Action::StopAll`.
+  re-registers when the binding set changed. Its sink sends presses to the `triggers` thread and
+  errors to the UI.
 - UI: `ui::hotkey_section` (editor section; `recorder` and `bind_hint` widgets are reused by the
   settings for "Stop all"). Recording takes the next key press with a hotkey key from the
   window's input (logical key, physical as fallback); Esc cancels.
-- Known limit: hotkeys are handled in the frame loop. On Wayland, a window that's hidden (other
-  workspace, minimized) may get no frames, so presses wait until it's shown again.
 - Tests: `tests/portal_hotkeys.rs` runs a zbus mock of the portal on the container's session bus;
   `tests/x11_hotkeys.rs` presses keys with `xdotool` on Xvfb (no F13+ in its keymap). Both are
   gated like the PipeWire tests.
@@ -173,16 +181,16 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   `Settings::midi_input` (`MidiDevice::{Off, All, Port(name)}`, default `Off`) and polls the port
   list every `HOTPLUG_POLL` (2 s); `midi::hotplug::plan` (pure) says what to connect/drop. Ports are
   matched by their stable name (`midir`'s name without the `client:port` address,
-  `stable_port_name`). Events (`MidiEvent::{Ports, Connected, Trigger, Error}`) wake the UI
-  (`request_repaint`); errors are reported once until the same thing worked again.
+  `stable_port_name`). Triggers go to the `on_trigger` callback on the receiving MIDI thread;
+  `MidiEvent::{Ports, Connected, Error}` are polled by the UI (`wake` after each); errors are reported once until the same thing worked again.
 - `midi::message::Parser` (one per port): Note On with velocity > 0 triggers; CCs trigger on the
   rising edge across 64, tracked per channel + CC; everything else is ignored. Channels are 1–16.
 - `MidiBinding { port: Option<String>, channel, control }` on `SoundConfig::midi` and
   `Settings::midi_stop_all`; `port: None` matches any port ("Any device" in the editor). It's the
   one config struct without `#[serde(default)]` (a binding without channel/control means nothing).
 - App side (`app/midi.rs`): `MidiState::learning` captures the next trigger instead of acting on
-  it (`Action::Midi(MidiAction::Learn(..))`; closing the window or Esc cancels). Otherwise
-  `AppState::midi_actions` turns a trigger into `Action::StopAll`/`Action::Play`, like a click.
+  it (`Action::Midi(MidiAction::Learn(..))`; closing the window or Esc cancels). Otherwise the
+  `triggers` thread plays it (see App architecture).
   UI: `ui/midi_section.rs` (editor section, settings rows, shared learn widget).
 - `tests/midi_alsa.rs` needs `/dev/snd/seq` and runs only inside the container; it skips otherwise.
   The kernel sequencer isn't namespaced, so `in-container.sh` passes the host's through only with

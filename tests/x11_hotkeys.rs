@@ -39,7 +39,7 @@ fn grabbed_keys_are_reported_as_presses_and_releases() {
         return;
     }
     let (sender, events) = mpsc::channel();
-    let mut backend = X11Backend::start(EventSink::new(sender, || {})).expect("X11 backend");
+    let mut backend = X11Backend::start(EventSink::channel(sender)).expect("X11 backend");
     backend.register(&[
         binding("stop-all", None),
         binding("play-airhorn", Some("Ctrl+Shift+F12")),

@@ -5,6 +5,7 @@
 //! device skip it.
 
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use midir::os::unix::VirtualOutput;
@@ -50,13 +51,10 @@ fn events_until(service: &MidiService, done: impl Fn(&MidiEvent) -> bool) -> Vec
     }
 }
 
-fn triggers(events: &[MidiEvent]) -> Vec<MidiTrigger> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            MidiEvent::Trigger(trigger) => Some(trigger.clone()),
-            _ => None,
-        })
+/// The next `count` triggers.
+fn triggers(received: &mpsc::Receiver<MidiTrigger>, count: usize) -> Vec<MidiTrigger> {
+    (0..count)
+        .map(|_| received.recv_timeout(TIMEOUT).expect("a trigger arrives"))
         .collect()
 }
 
@@ -69,8 +67,12 @@ fn triggers_arrive_from_a_port_that_comes_and_goes() {
     let port = format!("{client}:out");
     let connected = MidiEvent::Connected(vec![port.clone()]);
     let mut out = controller(&client);
-    let service =
-        MidiService::start(Box::new(MidirInput::default()), POLL, || {}).expect("thread starts");
+    let (sender, received) = mpsc::channel();
+    let on_trigger = move |trigger| {
+        let _ = sender.send(trigger);
+    };
+    let service = MidiService::start(Box::new(MidirInput::default()), POLL, || {}, on_trigger)
+        .expect("thread starts");
     // Only ever the test's own port: the sequencer may be the host's, with real devices on it.
     service.select(MidiDevice::Port(port.clone()));
     events_until(&service, |event| *event == connected);
@@ -83,17 +85,13 @@ fn triggers_arrive_from_a_port_that_comes_and_goes() {
     ] {
         out.send(&message).expect("send");
     }
-    let events = events_until(
-        &service,
-        |event| matches!(event, MidiEvent::Trigger(trigger) if trigger.control == MidiControl::ControlChange(20)),
-    );
     let trigger = |channel, control| MidiTrigger {
         port: port.clone(),
         channel,
         control,
     };
     assert_eq!(
-        triggers(&events),
+        triggers(&received, 2),
         [
             trigger(10, MidiControl::Note(36)),
             trigger(1, MidiControl::ControlChange(20))
@@ -111,6 +109,5 @@ fn triggers_arrive_from_a_port_that_comes_and_goes() {
     let mut out = controller(&client);
     events_until(&service, |event| *event == connected);
     out.send(&[0x90, 40, 1]).expect("send");
-    let events = events_until(&service, |event| matches!(event, MidiEvent::Trigger(_)));
-    assert_eq!(triggers(&events), [trigger(1, MidiControl::Note(40))]);
+    assert_eq!(triggers(&received, 1), [trigger(1, MidiControl::Note(40))]);
 }

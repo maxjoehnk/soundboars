@@ -1,7 +1,8 @@
 //! Global hotkeys as the app sees them: which bindings the config asks for, keeping the backend
-//! (and its registered bindings) in sync with the config, and turning presses into what to do.
+//! (and its registered bindings) in sync with the config, and handing presses to the `triggers`
+//! thread ([`super::triggers`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -9,6 +10,7 @@ use crate::config::Config;
 use crate::hotkeys::{BackendKind, Binding, Capabilities, EventSink, HotkeyBackend, HotkeyEvent};
 
 use super::services::HotkeyBackends;
+use super::triggers::Trigger;
 
 /// The shortcut id of "Stop all".
 pub const STOP_ALL_ID: &str = "stop-all";
@@ -18,13 +20,6 @@ pub const STOP_ALL_ID: &str = "stop-all";
 pub enum Target {
     Play(PathBuf),
     StopAll,
-}
-
-/// What came of the hotkeys since the last poll.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    Triggered(Target),
-    Error(String),
 }
 
 /// The bindings the config asks for: every sound with a shortcut id, and "Stop all".
@@ -108,27 +103,42 @@ fn file_stem(file_name: &str) -> String {
 pub struct Hotkeys {
     backends: Box<dyn HotkeyBackends>,
     sink: EventSink,
-    events: mpsc::Receiver<HotkeyEvent>,
+    errors: mpsc::Receiver<String>,
     /// The backend kind last started (even if starting failed, so it isn't retried every frame).
     kind: Option<BackendKind>,
     backend: Option<Box<dyn HotkeyBackend>>,
     /// What the backend has registered.
     registered: Vec<Binding>,
-    targets: HashMap<String, Target>,
 }
 
 impl Hotkeys {
-    /// `wake` is called from the backends' threads whenever there is an event to poll.
-    pub fn new(backends: Box<dyn HotkeyBackends>, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        let (sender, events) = mpsc::channel();
+    /// Presses go to `triggers`. Errors are polled; `wake` is called from the backends' threads
+    /// whenever there is one.
+    pub fn new(
+        backends: Box<dyn HotkeyBackends>,
+        triggers: mpsc::Sender<Trigger>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let (error_tx, errors) = mpsc::channel();
+        // Sending fails only when the app is gone.
+        let sink = EventSink::new(move |event| match event {
+            HotkeyEvent::Pressed(id) => {
+                let _ = triggers.send(Trigger::Hotkey(id));
+            }
+            HotkeyEvent::Released(_) => {}
+            HotkeyEvent::Error(error) => {
+                if error_tx.send(error).is_ok() {
+                    wake();
+                }
+            }
+        });
         Self {
             backends,
-            sink: EventSink::new(sender, wake),
-            events,
+            sink,
+            errors,
             kind: None,
             backend: None,
             registered: Vec::new(),
-            targets: HashMap::new(),
         }
     }
 
@@ -138,12 +148,11 @@ impl Hotkeys {
         let error = (self.kind != Some(kind))
             .then(|| self.restart(kind))
             .flatten();
-        let (bindings, targets): (Vec<Binding>, Vec<Target>) = bindings(config).into_iter().unzip();
+        let bindings: Vec<Binding> = bindings(config).into_iter().map(|(b, _)| b).collect();
         if bindings != self.registered {
             if let Some(backend) = &mut self.backend {
                 backend.register(&bindings);
             }
-            self.targets = bindings.iter().map(|b| b.id.clone()).zip(targets).collect();
             self.registered = bindings;
         }
         error
@@ -170,16 +179,9 @@ impl Hotkeys {
             .unwrap_or_default()
     }
 
-    /// The presses and errors since the last call. Releases are ignored.
-    pub fn poll(&self) -> Vec<Outcome> {
-        self.events
-            .try_iter()
-            .filter_map(|event| match event {
-                HotkeyEvent::Pressed(id) => self.targets.get(&id).cloned().map(Outcome::Triggered),
-                HotkeyEvent::Released(_) => None,
-                HotkeyEvent::Error(error) => Some(Outcome::Error(error)),
-            })
-            .collect()
+    /// The backends' errors since the last call.
+    pub fn errors(&self) -> Vec<String> {
+        self.errors.try_iter().collect()
     }
 }
 

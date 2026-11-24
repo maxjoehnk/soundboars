@@ -127,6 +127,14 @@ impl AudioEngine {
         self.send(Message::SetTarget(None));
     }
 
+    /// A handle that plays and stops sounds from any thread, e.g. the one handling hotkeys and
+    /// MIDI. It does nothing once the engine is dropped.
+    pub fn play_handle(&self) -> PlayHandle {
+        PlayHandle {
+            messages: self.messages.clone(),
+        }
+    }
+
     pub fn events(&self) -> &mpsc::Receiver<EngineEvent> {
         &self.events
     }
@@ -142,6 +150,24 @@ impl AudioEngine {
     fn send(&self, message: Message) {
         // Fails only if the control thread is gone, and then nothing can be played anymore.
         let _ = self.messages.send(message);
+    }
+}
+
+/// Plays and stops sounds like [`AudioEngine::play`] and [`AudioEngine::stop_all`], from any
+/// thread (see [`AudioEngine::play_handle`]).
+#[derive(Clone)]
+pub struct PlayHandle {
+    messages: mpsc::Sender<Message>,
+}
+
+impl PlayHandle {
+    pub fn play(&self, request: PlayRequest) {
+        // Fails only if the engine is gone, and then nothing can be played anymore.
+        let _ = self.messages.send(Message::Play(request));
+    }
+
+    pub fn stop_all(&self) {
+        let _ = self.messages.send(Message::StopAll);
     }
 }
 
@@ -199,5 +225,11 @@ mod tests {
     fn the_engine_can_move_to_another_thread() {
         fn assert_send<T: Send>() {}
         assert_send::<AudioEngine>();
+    }
+
+    #[test]
+    fn the_play_handle_can_be_shared_between_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PlayHandle>();
     }
 }

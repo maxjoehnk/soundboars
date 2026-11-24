@@ -222,7 +222,7 @@ fn the_portal_backend_binds_shortcuts_and_reports_activations() {
         return;
     }
     let (sender, events) = mpsc::channel();
-    let sink = EventSink::new(sender, || {});
+    let sink = EventSink::channel(sender);
     let airhorn = binding("play-airhorn", "Play Airhorn", "Ctrl+Shift+F13");
     let stop_all = binding("stop-all", "Stop all sounds", "Ctrl+Pause");
 
