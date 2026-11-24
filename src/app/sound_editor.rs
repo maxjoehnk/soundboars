@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{Destination, PlayRequest, Playing, Trim, Waveform};
 use crate::config::SoundConfig;
 use crate::hotkeys::Hotkey;
+use crate::midi::MidiBinding;
 
 /// The shortest trimmed sound the handles allow.
 pub const MIN_LENGTH_MS: u64 = 50;
@@ -24,6 +25,9 @@ pub enum EditorAction {
     Release,
     /// Play the whole sound again.
     Reset,
+    ClearMidi,
+    /// Whether the MIDI binding reacts to any port or only to the one it was learned from.
+    MidiAnyDevice(bool),
     Preview,
     StopPreview,
     Save,
@@ -74,6 +78,9 @@ pub struct SoundEditor {
     pub shortcut_id: Option<String>,
     /// The next key combination pressed becomes the hotkey.
     pub recording: bool,
+    /// As learned or saved, with its port if it has one; see [`Self::midi_binding`].
+    pub midi: Option<MidiBinding>,
+    pub midi_any_device: bool,
 }
 
 impl SoundEditor {
@@ -95,6 +102,8 @@ impl SoundEditor {
             hotkey: saved.hotkey,
             shortcut_id: saved.shortcut_id.clone(),
             recording: false,
+            midi: saved.midi.clone(),
+            midi_any_device: saved.midi.as_ref().is_some_and(|midi| midi.port.is_none()),
         }
     }
 
@@ -161,6 +170,8 @@ impl SoundEditor {
                 self.shortcut_id = None;
                 self.recording = false;
             }
+            EditorAction::ClearMidi => self.midi = None,
+            EditorAction::MidiAnyDevice(any) => self.midi_any_device = any,
             EditorAction::Preview
             | EditorAction::StopPreview
             | EditorAction::Save
@@ -186,8 +197,22 @@ impl SoundEditor {
         self.preview_start_ms + duration_ms(elapsed.min(preview.duration))
     }
 
-    /// Writes the volume, trim and hotkey into `config`: a trim to the end of the sound is stored
-    /// as no end, so the whole sound is played without any trim at all.
+    /// Binds the sound to a learned trigger.
+    pub fn midi_learned(&mut self, binding: MidiBinding) {
+        self.midi = Some(binding);
+    }
+
+    /// The binding to save: without its port when it should react to any device.
+    pub fn midi_binding(&self) -> Option<MidiBinding> {
+        let mut binding = self.midi.clone()?;
+        if self.midi_any_device {
+            binding.port = None;
+        }
+        Some(binding)
+    }
+
+    /// Writes the volume, trim, MIDI binding and hotkey into `config`: a trim to the end of the
+    /// sound is stored as no end, so the whole sound is played without any trim at all.
     pub fn apply_to(&self, config: &mut SoundConfig) {
         let trim = self.trim().unwrap_or_default();
         config.volume = self.volume;
@@ -195,6 +220,7 @@ impl SoundEditor {
         config.end_ms = trim.end_ms;
         config.hotkey = self.hotkey;
         config.shortcut_id = self.shortcut_id.clone();
+        config.midi = self.midi_binding();
     }
 
     /// The edited trim, `None` for the whole sound.
@@ -268,6 +294,7 @@ pub fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiControl;
 
     const SOUND_MS: u64 = 2_000;
 
@@ -412,6 +439,42 @@ mod tests {
             (saved(&editor).start_ms, saved(&editor).end_ms),
             (300, Some(1_200))
         );
+    }
+
+    #[test]
+    fn midi_bindings_are_learned_cleared_and_saved() {
+        let mut editor = editor(0, None);
+        assert_eq!(editor.midi_binding(), None);
+        let learned = MidiBinding {
+            port: Some("MPD218:MPD218 MIDI 1".to_owned()),
+            channel: 1,
+            control: MidiControl::Note(36),
+        };
+        editor.midi_learned(learned.clone());
+        assert_eq!(saved(&editor).midi, Some(learned.clone()));
+
+        editor.apply(EditorAction::MidiAnyDevice(true));
+        let any_port = MidiBinding {
+            port: None,
+            ..learned.clone()
+        };
+        assert_eq!(saved(&editor).midi, Some(any_port.clone()));
+        editor.apply(EditorAction::MidiAnyDevice(false));
+        assert_eq!(saved(&editor).midi, Some(learned));
+
+        let reopened = SoundEditor::open(&editor.path, &saved(&editor));
+        assert!(!reopened.midi_any_device);
+        let mut reopened = SoundEditor::open(
+            &editor.path,
+            &SoundConfig {
+                midi: Some(any_port),
+                ..SoundConfig::default()
+            },
+        );
+        assert!(reopened.midi_any_device);
+
+        reopened.apply(EditorAction::ClearMidi);
+        assert_eq!(saved(&reopened).midi, None);
     }
 
     #[test]

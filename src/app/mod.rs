@@ -3,11 +3,13 @@
 //! changes state or talks to services itself.
 
 mod hotkeys;
+mod midi;
 mod services;
 mod sound_editor;
 mod state;
 mod targets;
 mod ui;
+mod url_import;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -19,14 +21,18 @@ use crate::audio::decode::probe_duration;
 use crate::audio::{EngineEvent, Retrigger, Waveform};
 use crate::config::{ConfigStore, SavedTarget, Settings, TabConfig, Theme};
 use crate::hotkeys::{BackendKind, Hotkey};
+use crate::import::{DownloadEvent, Downloader};
 use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
+use crate::midi::{MidiEvent, MidiService, MidiTrigger};
 
 pub use hotkeys::STOP_ALL_ID;
+pub use midi::{LearnTarget, MidiAction, MidiState};
 pub use services::{AudioBackend, FolderPicker, HotkeyBackends, PortalFolderPicker, SystemHotkeys};
 pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
 pub use targets::{NO_APPS_HINT, Targets};
+pub use url_import::{ImportStatus, UrlImport, UrlImportAction};
 
 /// The app ID of all windows (Wayland app ID, X11 class), and the portal's and `.desktop` file's.
 pub const APP_ID: &str = "me.maxjoehnk.soundboars";
@@ -35,7 +41,8 @@ pub const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-256.png");
 
 /// How often to look for engine and folder events while idle.
 const IDLE_POLL: Duration = Duration::from_millis(250);
-/// How often to redraw while sounds play (for their progress bars) or a waveform is loading.
+/// How often to redraw while sounds play (for their progress bars), a waveform is loading or a
+/// download runs.
 const PLAYING_REPAINT: Duration = Duration::from_millis(50);
 
 /// Something the user did.
@@ -60,6 +67,10 @@ pub enum Action {
     Editor(EditorAction),
     /// Starts (`true`) or cancels recording the "Stop all" hotkey in the settings.
     RecordStopAllHotkey(bool),
+    Midi(MidiAction),
+    /// Opens the "Add sound from URL" window.
+    OpenUrlImport,
+    UrlImport(UrlImportAction),
 }
 
 /// A change to [`Settings`].
@@ -107,6 +118,9 @@ pub struct Services {
     pub folder_picker: Box<dyn FolderPicker>,
     pub config: ConfigStore,
     pub hotkeys: Box<dyn HotkeyBackends>,
+    /// `None` if its thread couldn't start.
+    pub midi: Option<MidiService>,
+    pub downloader: Box<dyn Downloader>,
 }
 
 pub struct App {
@@ -114,8 +128,10 @@ pub struct App {
     audio: Option<Box<dyn AudioBackend>>,
     watcher: Box<dyn FolderWatcher>,
     folder_picker: Box<dyn FolderPicker>,
+    midi: Option<MidiService>,
     picked_folders: (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>),
     store: ConfigStore,
+    downloader: Box<dyn Downloader>,
     /// Measures the sounds for their tiles; `None` if its thread couldn't start.
     durations: Option<DurationProbe>,
     /// The config changed and hasn't been saved yet.
@@ -132,6 +148,7 @@ impl App {
     pub fn new(services: Services) -> Self {
         let (config, config_error) = services.config.load();
         let mut state = AppState::new(config);
+        state.url_import_unavailable = services.downloader.unavailable();
         state
             .errors
             .extend(config_error.map(|error| error.to_string()));
@@ -157,8 +174,10 @@ impl App {
             audio,
             watcher: services.watcher,
             folder_picker: services.folder_picker,
+            midi: services.midi,
             picked_folders: mpsc::channel(),
             store: services.config,
+            downloader: services.downloader,
             durations: start_duration_probe(),
             unsaved: false,
             applied_theme: None,
@@ -169,6 +188,7 @@ impl App {
         app.measure_sounds();
         app.apply_settings();
         app.sync_hotkeys();
+        app.select_midi_input();
         for error in &app.state.errors {
             tracing::warn!("{error}");
         }
@@ -191,11 +211,18 @@ impl App {
         for event in self.watcher.poll() {
             self.folder_event(event);
         }
+        let midi_events = self.midi.as_ref().map(MidiService::poll);
+        for event in midi_events.into_iter().flatten() {
+            self.midi_event(event);
+        }
         while let Ok(folder) = self.picked_folders.1.try_recv() {
             self.add_tab(folder);
         }
         for outcome in self.hotkeys.poll() {
             self.hotkey_outcome(outcome);
+        }
+        for event in self.downloader.poll() {
+            self.download_event(event);
         }
         let measured = self.durations.as_ref().map(DurationProbe::poll);
         for (path, duration) in measured.into_iter().flatten() {
@@ -221,7 +248,12 @@ impl App {
                 .pick_folder(self.picked_folders.0.clone()),
             Action::RemoveTab(tab) => self.remove_tab(tab),
             Action::ChangeSetting(setting) => self.change_setting(setting),
-            Action::ShowSettings(open) => self.state.settings_open = open,
+            Action::ShowSettings(open) => {
+                self.state.settings_open = open;
+                if !open {
+                    self.state.midi.stop_learning(LearnTarget::StopAll);
+                }
+            }
             Action::DismissError(index) => {
                 if index < self.state.errors.len() {
                     self.state.errors.remove(index);
@@ -229,6 +261,14 @@ impl App {
             }
             Action::EditSound(path) => self.edit_sound(&path),
             Action::Editor(action) => self.editor_action(action),
+            Action::Midi(action) => self.midi_action(action),
+            Action::OpenUrlImport => {
+                let tab = self.state.tab;
+                self.state
+                    .url_import
+                    .get_or_insert_with(|| UrlImport::open(tab));
+            }
+            Action::UrlImport(action) => self.url_import_action(action),
             Action::RecordStopAllHotkey(recording) => self.state.recording_stop_all = recording,
         }
         self.sync_hotkeys();
@@ -280,6 +320,41 @@ impl App {
             }
             EngineEvent::Started(_) | EngineEvent::Finished { .. } => {}
             EngineEvent::Waveform { path, waveform } => self.waveform_loaded(&path, waveform),
+        }
+    }
+
+    fn url_import_action(&mut self, action: UrlImportAction) {
+        let Some(import) = &mut self.state.url_import else {
+            return;
+        };
+        match action {
+            UrlImportAction::Download => {
+                if let Some((url, folder)) = import.start(&self.state.config.tabs) {
+                    self.downloader.start(&url, &folder);
+                }
+            }
+            UrlImportAction::Close => {
+                self.downloader.cancel();
+                self.state.url_import = None;
+            }
+            _ => import.edit(action),
+        }
+    }
+
+    fn download_event(&mut self, event: DownloadEvent) {
+        let Some(import) = &mut self.state.url_import else {
+            return;
+        };
+        match event {
+            DownloadEvent::Progress(stage) => import.status = ImportStatus::Running(stage),
+            DownloadEvent::Failed(error) => import.status = ImportStatus::Failed(error),
+            DownloadEvent::Done(path) => {
+                self.state.url_import = None;
+                if let Some(tab) = path.parent().and_then(|dir| self.state.tab_index(dir)) {
+                    self.state.select_tab(tab);
+                }
+                self.edit_sound(&path);
+            }
         }
     }
 
@@ -365,8 +440,61 @@ impl App {
 
     /// Closes the editor, if open, discarding unsaved changes and stopping its preview.
     fn close_editor(&mut self) {
+        self.state.midi.stop_learning(LearnTarget::Sound);
         if self.state.editor.take().is_some() {
             self.with_audio(|audio| audio.stop_preview());
+        }
+    }
+
+    fn midi_event(&mut self, event: MidiEvent) {
+        match event {
+            MidiEvent::Ports(ports) => self.state.midi.ports = ports,
+            MidiEvent::Connected(ports) => self.state.midi.connected = ports,
+            MidiEvent::Trigger(trigger) => self.midi_trigger(&trigger),
+            MidiEvent::Error(message) => self.show_error(message),
+        }
+    }
+
+    /// Learns the trigger while learning, else acts on it like a click would.
+    fn midi_trigger(&mut self, trigger: &MidiTrigger) {
+        match self.state.midi.learn(trigger) {
+            Some((LearnTarget::Sound, binding)) => {
+                if let Some(editor) = &mut self.state.editor {
+                    editor.midi_learned(binding);
+                }
+            }
+            Some((LearnTarget::StopAll, binding)) => {
+                self.state.config.settings.midi_stop_all = Some(binding);
+                self.unsaved = true;
+            }
+            None => {
+                for action in self.state.midi_actions(trigger) {
+                    self.apply(action);
+                }
+            }
+        }
+    }
+
+    fn midi_action(&mut self, action: MidiAction) {
+        match action {
+            MidiAction::SelectInput(device) => {
+                self.state.config.settings.midi_input = device;
+                self.select_midi_input();
+                self.unsaved = true;
+            }
+            MidiAction::Learn(target) => self.state.midi.learning = Some(target),
+            MidiAction::CancelLearn => self.state.midi.learning = None,
+            MidiAction::ClearStopAll => {
+                self.state.config.settings.midi_stop_all = None;
+                self.unsaved = true;
+            }
+        }
+    }
+
+    /// Tells the MIDI thread which ports to listen to.
+    fn select_midi_input(&self) {
+        if let Some(midi) = &self.midi {
+            midi.select(self.state.config.settings.midi_input.clone());
         }
     }
 
@@ -550,7 +678,12 @@ impl eframe::App for App {
             .state
             .editor
             .as_ref()
-            .is_some_and(|editor| editor.waveform == WaveformState::Loading);
+            .is_some_and(|editor| editor.waveform == WaveformState::Loading)
+            || self
+                .state
+                .url_import
+                .as_ref()
+                .is_some_and(UrlImport::is_running);
         ctx.request_repaint_after(if self.state.playing.is_empty() && !loading {
             IDLE_POLL
         } else {

@@ -18,6 +18,9 @@ egui = { version = "0.37", default-features = false, features = ["monochrome_emo
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false }
 global-hotkey = "0.10"
+midir = "0.11"
+# Cancelling a URL download kills yt-dlp's process group.
+libc = "0.2"
 notify = "8"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
@@ -25,6 +28,8 @@ rtrb = "0.4"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
 symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4"] }
+# URL downloads work in a staging folder that is removed when they end.
+tempfile = "3"
 thiserror = "2"
 toml = "1"
 tracing = "0.1"
@@ -32,7 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe"] }
-tempfile = "3"
 # The mock GlobalShortcuts portal in tests/portal_hotkeys.rs (same zbus as ashpd).
 zbus = { version = "6", default-features = false, features = ["default-rt", "service"] }
 

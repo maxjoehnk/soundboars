@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::accesskit::Role;
 use eframe::egui::{Key, Modifiers, Pos2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use soundboars::app::{App, AudioBackend, FolderPicker, HotkeyBackends, Services};
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
@@ -18,7 +18,12 @@ use soundboars::config::{Config, ConfigStore, SavedTarget, SoundConfig, TabConfi
 use soundboars::hotkeys::{
     BackendKind, BindHint, Binding, Capabilities, EventSink, Hotkey, HotkeyBackend, HotkeyEvent,
 };
+use soundboars::import::{DownloadEvent, Downloader, Stage};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
+use soundboars::midi::{
+    Connection, HOTPLUG_POLL, MidiBinding, MidiControl, MidiDevice, MidiError, MidiInput, MidiPort,
+    MidiService, OnMessage,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
@@ -53,6 +58,12 @@ struct World {
     hotkey_capabilities: Capabilities,
     /// Starting a hotkey backend fails with this.
     hotkey_error: Option<String>,
+    /// What the fake downloader reports as missing.
+    downloader_unavailable: Option<String>,
+    /// The `(url, folder)` of every started download.
+    downloads: Vec<(String, PathBuf)>,
+    cancelled_downloads: usize,
+    download_events: Vec<DownloadEvent>,
 }
 
 #[derive(Clone, Default)]
@@ -182,10 +193,62 @@ impl HotkeyBackend for FakeHotkeyBackend {
     }
 }
 
+/// MIDI input ports; a connected port's callback receives what the test sends.
+#[derive(Default)]
+struct MidiWorld {
+    ports: Vec<MidiPort>,
+    /// The callbacks of the connected ports, by port id.
+    listeners: Vec<(String, OnMessage)>,
+}
+
+#[derive(Clone, Default)]
+struct FakeMidi(Arc<Mutex<MidiWorld>>);
+
+impl FakeMidi {
+    fn with<R>(&self, f: impl FnOnce(&mut MidiWorld) -> R) -> R {
+        f(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl MidiInput for FakeMidi {
+    fn ports(&mut self) -> Result<Vec<MidiPort>, MidiError> {
+        Ok(self.with(|world| world.ports.clone()))
+    }
+
+    fn connect(&mut self, port: &MidiPort, on_message: OnMessage) -> Result<Connection, MidiError> {
+        self.with(|world| world.listeners.push((port.id.clone(), on_message)));
+        Ok(Box::new(()))
+    }
+}
+
+const MPD: &str = "MPD218:MPD218 MIDI 1";
+const MPD_ID: &str = "20:0";
+
+struct FakeDownloader(Shared);
+
+impl Downloader for FakeDownloader {
+    fn unavailable(&self) -> Option<String> {
+        self.0.with(|world| world.downloader_unavailable.clone())
+    }
+    fn start(&mut self, url: &str, folder: &Path) {
+        self.0
+            .with(|world| world.downloads.push((url.to_owned(), folder.to_owned())));
+    }
+    fn cancel(&mut self) {
+        self.0.with(|world| world.cancelled_downloads += 1);
+    }
+    fn poll(&mut self) -> Vec<DownloadEvent> {
+        self.0
+            .with(|world| std::mem::take(&mut world.download_events))
+    }
+}
+
 /// Two tabs: `Memes` (Airhorn, Bruh) and `SFX` (Applause, Horn). Airhorn has a volume and a trim.
+/// One MIDI port, the MPD218.
 struct Setup {
     dir: tempfile::TempDir,
     shared: Shared,
+    midi: FakeMidi,
     store: ConfigStore,
 }
 
@@ -221,9 +284,17 @@ impl Setup {
         // Not the session's default, which depends on where the tests run.
         config.settings.hotkey_backend = Some(BackendKind::X11);
         store.save(&config).expect("save config");
+        let midi = FakeMidi::default();
+        midi.with(|world| {
+            world.ports.push(MidiPort {
+                id: MPD_ID.to_owned(),
+                name: MPD.to_owned(),
+            })
+        });
         Self {
             dir,
             shared: Shared::default(),
+            midi,
             store,
         }
     }
@@ -253,16 +324,24 @@ impl Setup {
         &self,
         audio: Result<Box<dyn AudioBackend>, String>,
     ) -> Harness<'static, App> {
-        let services = Services {
+        let mut services = Services {
             audio,
             watcher: Box::new(FakeWatcher(self.shared.clone())),
             folder_picker: Box::new(FakePicker(self.shared.clone())),
             config: self.store.clone(),
             hotkeys: Box::new(FakeHotkeys(self.shared.clone())),
+            midi: None,
+            downloader: Box::new(FakeDownloader(self.shared.clone())),
         };
+        let midi = Box::new(self.midi.clone());
         let mut harness = Harness::builder()
             .with_size([1000.0, 700.0])
-            .build_eframe(|_cc| App::new(services));
+            .build_eframe(|cc| {
+                let ctx = cc.egui_ctx.clone();
+                let wake = move || ctx.request_repaint();
+                services.midi = Some(MidiService::start(midi, HOTPLUG_POLL, wake).expect("thread"));
+                App::new(services)
+            });
         harness.run();
         harness
     }
@@ -651,8 +730,10 @@ fn airhorn(setup: &Setup) -> PathBuf {
 
 /// Opens the editor for Airhorn through the tile's context menu.
 fn open_editor(harness: &mut Harness<'_, App>) {
-    // The tile, whatever its subtitle.
-    harness.get_by_label_contains("Airhorn\n").click_secondary();
+    // The tile's subtitle may go on with the MIDI binding and the hotkey.
+    harness
+        .get_by_label_contains(&tile("Airhorn"))
+        .click_secondary();
     harness.run();
     harness.get_by_label("✏ Edit…").click();
     harness.run();
@@ -1070,7 +1151,7 @@ fn clearing_the_hotkey_removes_the_global_shortcut() {
     let mut harness = setup.start();
     open_editor_with_waveform(&setup, &mut harness);
 
-    click_editor_button(&mut harness, "Clear");
+    click_editor_button(&mut harness, "Clear hotkey");
     click_editor_button(&mut harness, "Save");
 
     let saved = saved_airhorn(&setup);
@@ -1217,7 +1298,7 @@ fn the_stop_all_hotkey_is_recorded_in_the_settings() {
     );
     assert!(harness.query_by_label("Ctrl+Pause").is_some());
 
-    harness.get_by_label("Clear").click();
+    harness.get_by_label("Clear hotkey").click();
     harness.run();
     assert_eq!(setup.config().settings.stop_all_hotkey, None);
 }
@@ -1262,5 +1343,465 @@ fn switching_the_hotkey_backend_starts_it_and_registers_again() {
                 r#"hl.bind("CTRL + F13", hl.dsp.global("me.maxjoehnk.soundboars:stop-all"))"#
             )
             .is_some()
+    );
+}
+
+// MIDI. The fake MPD218 is the only port; tests that need it connected select it in the config.
+
+fn listening_to_mpd(config: &mut Config) {
+    config.settings.midi_input = MidiDevice::Port(MPD.to_owned());
+}
+
+fn note_36(port: Option<&str>) -> MidiBinding {
+    MidiBinding {
+        port: port.map(str::to_owned),
+        channel: 1,
+        control: MidiControl::Note(36),
+    }
+}
+
+/// Sends a message from the MPD218 once the app listens to it, and lets the app handle it.
+fn send_midi(setup: &Setup, harness: &mut Harness<'_, App>, message: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sent = setup.midi.with(|world| {
+            let listener = world.listeners.iter_mut().find(|(id, _)| id == MPD_ID);
+            listener
+                .map(|(_, on_message)| on_message(message))
+                .is_some()
+        });
+        if sent {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the app never connected to the MPD218"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run();
+    }
+    harness.run();
+}
+
+fn plays(setup: &Setup) -> Vec<PathBuf> {
+    let calls = setup.shared.calls();
+    calls
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Play(request) => Some(request.path),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_note_learned_in_the_editor_is_saved_and_shown_on_the_tile() {
+    let setup = Setup::new().with_config(listening_to_mpd);
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label("—").is_some(), "not bound");
+
+    click_editor_button(&mut harness, "Learn");
+    assert!(harness.query_by_label("Cancel learning").is_some());
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+
+    assert!(plays(&setup).is_empty(), "learning doesn't play");
+    assert!(harness.query_by_label("Cancel learning").is_none());
+    assert!(harness.query_by_label("Note 36 · ch 1 · MPD218").is_some());
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).midi, Some(note_36(Some(MPD))));
+    assert!(harness.query_by_label("Airhorn\nWAV · Note 36").is_some());
+}
+
+#[test]
+fn a_bound_trigger_plays_the_sound_like_a_click() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let mut harness = setup.start();
+    setup.shared.clear_calls();
+
+    send_midi(&setup, &mut harness, &[0x80, 36, 0]);
+    send_midi(&setup, &mut harness, &[0x90, 37, 100]);
+    assert!(setup.shared.calls().is_empty());
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+
+    assert_eq!(
+        setup.shared.calls(),
+        [Call::Play(PlayRequest {
+            path: airhorn(&setup),
+            trim: Some(Trim {
+                start_ms: 100,
+                end_ms: Some(900)
+            }),
+            volume: 0.5,
+            destination: Destination::Everywhere,
+        })]
+    );
+}
+
+#[test]
+fn learning_can_be_cancelled_with_escape() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        config.tabs[0].sounds.insert(
+            "Bruh.wav".to_owned(),
+            SoundConfig {
+                midi: Some(note_36(None)),
+                ..SoundConfig::default()
+            },
+        );
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Learn");
+    harness.key_press(eframe::egui::Key::Escape);
+    harness.run();
+    assert!(harness.query_by_label("Cancel learning").is_none());
+
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+    assert_eq!(plays(&setup), [setup.folder("Memes").join("Bruh.wav")]);
+    assert!(harness.query_by_label("—").is_some(), "not bound");
+}
+
+#[test]
+fn a_binding_can_be_cleared() {
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label("Note 36 · ch 1 · MPD218").is_some());
+
+    click_editor_button(&mut harness, "Clear");
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).midi, None);
+}
+
+#[test]
+fn a_binding_can_react_to_any_device() {
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Any device");
+    assert!(harness.query_by_label("Note 36 · ch 1").is_some());
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).midi, Some(note_36(None)));
+}
+
+#[test]
+fn learning_a_binding_another_sound_uses_warns() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        config.tabs[1].sounds.insert(
+            "Horn.wav".to_owned(),
+            SoundConfig {
+                midi: Some(note_36(None)),
+                ..SoundConfig::default()
+            },
+        );
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label_contains("Also triggers").is_none());
+
+    click_editor_button(&mut harness, "Learn");
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+
+    assert!(harness.query_by_label("⚠ Also triggers: Horn").is_some());
+    click_editor_button(&mut harness, "Save");
+    assert_eq!(saved_airhorn(&setup).midi, Some(note_36(Some(MPD))));
+}
+
+#[test]
+fn the_midi_input_is_chosen_in_the_settings_and_remembered() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    assert_eq!(
+        harness.get_by_label("MIDI input:").value().as_deref(),
+        Some("(none)")
+    );
+    assert!(harness.query_by_label("nothing").is_some());
+
+    harness.get_by_label("MIDI input:").click();
+    harness.run();
+    harness.get_by_label(MPD).click();
+    harness.run();
+
+    assert_eq!(
+        setup.config().settings.midi_input,
+        MidiDevice::Port(MPD.to_owned())
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.query_by_label("nothing").is_some() {
+        assert!(Instant::now() < deadline, "never connected");
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run();
+    }
+    assert!(harness.query_by_label(MPD).is_some());
+}
+
+#[test]
+fn stop_all_can_be_learned_in_the_settings() {
+    let setup = Setup::new().with_config(listening_to_mpd);
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    setup.shared.clear_calls();
+
+    harness.get_by_label("Learn").click();
+    harness.run();
+    send_midi(&setup, &mut harness, &[0xB0, 20, 127]);
+
+    assert!(setup.shared.calls().is_empty(), "learning doesn't stop");
+    let learned = MidiBinding {
+        port: Some(MPD.to_owned()),
+        channel: 1,
+        control: MidiControl::ControlChange(20),
+    };
+    assert_eq!(setup.config().settings.midi_stop_all, Some(learned));
+    assert!(harness.query_by_label("CC 20 · ch 1 · MPD218").is_some());
+
+    send_midi(&setup, &mut harness, &[0xB0, 20, 0]);
+    send_midi(&setup, &mut harness, &[0xB0, 20, 127]);
+    assert_eq!(setup.shared.calls(), [Call::StopAll]);
+
+    harness.get_by_label("Clear").click();
+    harness.run();
+    assert_eq!(setup.config().settings.midi_stop_all, None);
+}
+
+// "Add sound from URL", with a fake downloader.
+
+const URL_DIALOG: &str = "Add sound from URL";
+const URL_FIELD: &str = "Paste a YouTube (or any yt-dlp supported) URL:";
+const ADD_FROM_URL: &str = "🔗 Add from URL";
+const DOWNLOAD: &str = "⬇ Download";
+/// Frames to run after each input: the progress bar animates while downloading, so the UI never
+/// settles for `Harness::run`.
+const STEPS: usize = 4;
+
+fn report_download(setup: &Setup, harness: &mut Harness<'_, App>, event: DownloadEvent) {
+    setup.shared.with(|world| world.download_events.push(event));
+    harness.run_steps(STEPS);
+}
+
+fn downloads(setup: &Setup) -> Vec<(String, PathBuf)> {
+    setup.shared.with(|world| world.downloads.clone())
+}
+
+fn cancelled_downloads(setup: &Setup) -> usize {
+    setup.shared.with(|world| world.cancelled_downloads)
+}
+
+fn type_url(harness: &mut Harness<'_, App>, url: &str) {
+    let field = harness.get_by_label(URL_FIELD);
+    field.click();
+    field.type_text(url);
+    harness.run_steps(STEPS);
+}
+
+/// Opens the dialog and types `url`.
+fn enter_url(harness: &mut Harness<'_, App>, url: &str) {
+    harness.get_by_label(ADD_FROM_URL).click();
+    harness.run_steps(STEPS);
+    type_url(harness, url);
+}
+
+#[test]
+fn add_from_url_is_disabled_without_the_tools() {
+    let setup = Setup::new();
+    setup.shared.with(|world| {
+        world.downloader_unavailable = Some("Install yt-dlp (not found: yt-dlp).".to_owned())
+    });
+    let mut harness = setup.start();
+
+    let button = harness.get_by_label(ADD_FROM_URL);
+    assert!(button.accesskit_node().is_disabled());
+    button.hover();
+    harness.run_steps(STEPS);
+    assert!(
+        harness
+            .query_by_label_contains("not found: yt-dlp")
+            .is_some()
+    );
+    harness.get_by_label(ADD_FROM_URL).click();
+    harness.run_steps(STEPS);
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+}
+
+#[test]
+fn a_downloaded_sound_opens_in_the_editor_in_its_tab() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    enter_url(&mut harness, "youtube.com/watch?v=1");
+    assert!(harness.query_by_label(URL_DIALOG).is_some());
+    assert!(
+        harness
+            .get_by_label(DOWNLOAD)
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        harness
+            .query_by_label_contains("http:// or https://")
+            .is_some()
+    );
+
+    harness
+        .get_by_label(URL_FIELD)
+        .set_text_value_accesskit("https://example.com/clip");
+    harness.run_steps(STEPS);
+    harness.get_by_label("Save to tab:").click();
+    harness.run_steps(STEPS);
+    let tabs = harness.query_all_by_label("SFX").collect::<Vec<_>>();
+    tabs.last().expect("the picker lists SFX").click();
+    harness.run_steps(STEPS);
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    let sfx = setup.folder("SFX");
+    assert_eq!(
+        downloads(&setup),
+        [("https://example.com/clip".to_owned(), sfx.clone())]
+    );
+    let half = DownloadEvent::Progress(Stage::Downloading(Some(0.5)));
+    report_download(&setup, &mut harness, half);
+    assert!(
+        harness
+            .query_by_label_contains("Downloading… 50%")
+            .is_some()
+    );
+    assert!(
+        harness
+            .get_by_label(DOWNLOAD)
+            .accesskit_node()
+            .is_disabled()
+    );
+    let converting = DownloadEvent::Progress(Stage::Converting);
+    report_download(&setup, &mut harness, converting);
+    assert!(
+        harness
+            .query_by_label_contains("Converting to MP3…")
+            .is_some()
+    );
+
+    // The folder watcher hasn't reported the new file yet.
+    let clip = sfx.join("Clip.mp3");
+    fs::write(&clip, b"").expect("write");
+    setup.shared.clear_calls();
+    report_download(&setup, &mut harness, DownloadEvent::Done(clip.clone()));
+
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+    assert!(harness.query_by_label("Edit sound – Clip.mp3").is_some());
+    assert_eq!(setup.shared.calls(), [Call::LoadWaveform(clip)]);
+    assert!(
+        harness.query_by_label(&tile("Applause")).is_some(),
+        "SFX is shown"
+    );
+    assert!(harness.query_by_label(&tile("Bruh")).is_none());
+    assert_eq!(cancelled_downloads(&setup), 0);
+}
+
+#[test]
+fn a_failed_download_shows_why_and_can_be_retried() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    enter_url(&mut harness, "https://example.com/gone");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    let failed = DownloadEvent::Failed("HTTP Error 404: File not found".to_owned());
+    report_download(&setup, &mut harness, failed);
+    assert!(
+        harness
+            .query_by_label("Failed: HTTP Error 404: File not found")
+            .is_some()
+    );
+    harness.get_by_label("⟳ Retry").click();
+    harness.run_steps(STEPS);
+
+    let download = ("https://example.com/gone".to_owned(), setup.folder("Memes"));
+    assert_eq!(
+        downloads(&setup),
+        [download.clone(), download],
+        "into the current tab by default"
+    );
+    assert!(harness.query_by_label_contains("Failed:").is_none());
+    assert!(harness.query_by_label_contains("Starting…").is_some());
+}
+
+#[test]
+fn closing_the_dialog_cancels_the_download() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    enter_url(&mut harness, "https://example.com/long");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    harness.get_by_label("Cancel").click();
+    harness.run_steps(STEPS);
+
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+    assert_eq!(cancelled_downloads(&setup), 1);
+
+    enter_url(&mut harness, "https://example.com/long");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+    // Kittest embeds dialogs in the main window, where its close request is the main viewport's.
+    harness
+        .input_mut()
+        .viewports
+        .entry(ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(ViewportEvent::Close);
+    harness.run_steps(STEPS);
+
+    assert!(harness.query_by_label(URL_DIALOG).is_none());
+    assert_eq!(cancelled_downloads(&setup), 2);
+}
+
+#[test]
+fn without_tabs_the_dialog_asks_for_a_folder_first() {
+    let setup = Setup::new().with_config(|config| config.tabs.clear());
+    let music = setup.folder("Music");
+    fs::create_dir(&music).expect("mkdir");
+    setup
+        .shared
+        .with(|world| world.folder_to_pick = Some(music.clone()));
+    let mut harness = setup.start();
+
+    harness.get_by_label(ADD_FROM_URL).click();
+    harness.run_steps(STEPS);
+    assert!(
+        harness
+            .query_by_label_contains("Add a folder as a tab first")
+            .is_some()
+    );
+    assert!(harness.query_by_label(URL_FIELD).is_none());
+
+    harness.get_by_label("➕ Add folder").click();
+    harness.run_steps(STEPS);
+    type_url(&mut harness, "https://example.com/a");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+
+    assert_eq!(
+        downloads(&setup),
+        [("https://example.com/a".to_owned(), music)]
     );
 }

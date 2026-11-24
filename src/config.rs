@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{RecordingApp, Retrigger, Trim};
 use crate::hotkeys::{self, BackendKind, Hotkey};
+use crate::midi::{MidiBinding, MidiDevice};
 
 /// Overrides where the config file lives (e.g. for tests).
 pub const CONFIG_PATH_ENV: &str = "SOUNDBOARS_CONFIG";
@@ -38,6 +39,10 @@ pub struct Settings {
     pub hotkey_backend: Option<BackendKind>,
     #[serde(deserialize_with = "hotkeys::hotkey::deserialize_lenient")]
     pub stop_all_hotkey: Option<Hotkey>,
+    /// The MIDI ports to listen to.
+    pub midi_input: MidiDevice,
+    /// Stops all sounds.
+    pub midi_stop_all: Option<MidiBinding>,
 }
 
 impl Default for Settings {
@@ -50,6 +55,8 @@ impl Default for Settings {
             theme: Theme::default(),
             hotkey_backend: None,
             stop_all_hotkey: None,
+            midi_input: MidiDevice::default(),
+            midi_stop_all: None,
         }
     }
 }
@@ -141,6 +148,7 @@ pub struct SoundConfig {
     /// changes once assigned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shortcut_id: Option<String>,
+    pub midi: Option<MidiBinding>,
 }
 
 impl Default for SoundConfig {
@@ -151,6 +159,7 @@ impl Default for SoundConfig {
             end_ms: None,
             hotkey: None,
             shortcut_id: None,
+            midi: None,
         }
     }
 }
@@ -288,6 +297,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiControl;
 
     fn store() -> (tempfile::TempDir, ConfigStore) {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -322,6 +332,11 @@ mod tests {
                 end_ms: Some(1500),
                 hotkey: "Ctrl+Shift+F13".parse().ok(),
                 shortcut_id: Some("play-airhorn".to_owned()),
+                midi: Some(MidiBinding {
+                    port: Some("MPD218:MPD218 MIDI 1".to_owned()),
+                    channel: 10,
+                    control: MidiControl::Note(36),
+                }),
             },
         );
         Config {
@@ -333,6 +348,12 @@ mod tests {
                 theme: Theme::Light,
                 hotkey_backend: Some(BackendKind::X11),
                 stop_all_hotkey: "Ctrl+Pause".parse().ok(),
+                midi_input: MidiDevice::Port("MPD218:MPD218 MIDI 1".to_owned()),
+                midi_stop_all: Some(MidiBinding {
+                    port: None,
+                    channel: 1,
+                    control: MidiControl::ControlChange(20),
+                }),
             },
             target: Some(SavedTarget {
                 process_binary: Some("Discord".to_owned()),
@@ -374,6 +395,7 @@ mod tests {
         assert!(text.contains("hotkey_backend = \"x11\""), "{text}");
         assert!(text.contains("hotkey = \"Ctrl+Shift+F13\""), "{text}");
         assert!(text.contains("shortcut_id = \"play-airhorn\""), "{text}");
+        assert!(text.contains("note = 36"), "{text}");
     }
 
     #[test]

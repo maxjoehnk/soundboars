@@ -9,8 +9,10 @@ use crate::config::{Config, SoundConfig};
 use crate::hotkeys::{BackendKind, Capabilities};
 use crate::library::{Library, Sound};
 
+use super::midi::MidiState;
 use super::sound_editor::SoundEditor;
 use super::targets::Targets;
+use super::url_import::UrlImport;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -37,6 +39,11 @@ pub struct AppState {
     pub default_hotkey_backend: BackendKind,
     /// The settings' "Stop all" hotkey recorder waits for a key combination.
     pub recording_stop_all: bool,
+    pub midi: MidiState,
+    /// The "Add sound from URL" window, while open.
+    pub url_import: Option<UrlImport>,
+    /// Why sounds can't be added from URLs (e.g. yt-dlp isn't installed).
+    pub url_import_unavailable: Option<String>,
 }
 
 impl AppState {
@@ -57,6 +64,9 @@ impl AppState {
             hotkey_capabilities: Capabilities::default(),
             default_hotkey_backend: BackendKind::default_for_session(),
             recording_stop_all: false,
+            midi: MidiState::default(),
+            url_import: None,
+            url_import_unavailable: None,
         }
     }
 
@@ -141,19 +151,18 @@ impl AppState {
             .collect()
     }
 
-    /// The second line of a tile: the trimmed length once known, else the file format; then the
-    /// hotkey, if the sound has one.
+    /// The second line of a tile: the trimmed length once known, else the file format; then what
+    /// triggers the sound, e.g. `0:01.20 · Note 36 · Ctrl+F13`.
     pub fn subtitle(&self, sound: &Sound) -> String {
-        let length = self.durations.get(&sound.path);
-        let meta = self.sound_config(&sound.path);
-        let first = match (length, &meta) {
-            (Some(&length), Some(meta)) => format_duration(meta.trimmed_length(length)),
-            _ => sound.format(),
+        let meta = self.sound_config(&sound.path).unwrap_or_default();
+        let length = match self.durations.get(&sound.path) {
+            Some(&length) => format_duration(meta.trimmed_length(length)),
+            None => sound.format(),
         };
-        match meta.and_then(|meta| meta.hotkey) {
-            Some(hotkey) => format!("{first} · {hotkey}"),
-            None => first,
-        }
+        let midi = meta.midi.map(|binding| binding.control.to_string());
+        let hotkey = meta.hotkey.map(|hotkey| hotkey.to_string());
+        let parts: Vec<String> = [Some(length), midi, hotkey].into_iter().flatten().collect();
+        parts.join(" · ")
     }
 
     /// The hotkey backend to use: the one chosen in the settings, else the session's default.
@@ -191,6 +200,7 @@ mod tests {
     use super::*;
     use crate::audio::Trim;
     use crate::config::TabConfig;
+    use crate::midi::{MidiBinding, MidiControl};
 
     struct Fixture {
         _dirs: [tempfile::TempDir; 2],
@@ -355,5 +365,17 @@ mod tests {
         assert_eq!(f.state.hotkey_backend(), BackendKind::Portal);
         f.state.config.settings.hotkey_backend = Some(BackendKind::Off);
         assert_eq!(f.state.hotkey_backend(), BackendKind::Off);
+    }
+
+    #[test]
+    fn subtitles_show_the_midi_binding() {
+        let mut f = fixture();
+        let bruh = f.state.visible_sounds()[1].clone();
+        f.state.sound_config_mut(&bruh.path).expect("in a tab").midi = Some(MidiBinding {
+            port: None,
+            channel: 1,
+            control: MidiControl::ControlChange(20),
+        });
+        assert_eq!(f.state.subtitle(&bruh), "WAV · CC 20");
     }
 }

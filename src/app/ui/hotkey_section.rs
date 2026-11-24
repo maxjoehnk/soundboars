@@ -122,6 +122,8 @@ pub fn recorder(
         }
         if ui
             .add_enabled(hotkey.is_some(), egui::Button::new("Clear"))
+            // Unique, next to the MIDI section's "Clear".
+            .accessible_name("Clear hotkey")
             .clicked()
         {
             event = Some(RecorderEvent::Clear);

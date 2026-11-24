@@ -4,6 +4,7 @@ use eframe::egui;
 
 use super::dialog::Dialog;
 use super::hotkey_section::{RecorderEvent, bind_hint, recorder};
+use super::midi_section;
 use crate::app::{Action, AppState, STOP_ALL_ID, Setting};
 use crate::audio::Retrigger;
 use crate::config::Theme;
@@ -16,13 +17,16 @@ pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
     let dialog = Dialog {
         id: "settings",
         title: "Settings",
-        size: [560.0, 240.0],
+        size: [560.0, 340.0],
     };
     let closed = dialog.show(ctx, |ui| {
         egui::Grid::new("settings")
             .num_columns(2)
             .spacing([16.0, 8.0])
-            .show(ui, |ui| rows(ui, state, actions));
+            .show(ui, |ui| {
+                rows(ui, state, actions);
+                midi_section::settings_rows(ui, state, actions);
+            });
         ui.separator();
         hotkey_settings(ui, state, actions);
     });
