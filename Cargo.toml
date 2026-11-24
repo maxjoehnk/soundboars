@@ -9,11 +9,15 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+ashpd = { version = "0.14", default-features = false, features = ["async-io", "global_shortcuts"] }
 bytemuck = "1"
 directories = "6"
 eframe = "0.37"
 # Bundles egui's emoji/icon fonts, so the icons in labels (⟳, ⚙, ⏹, …) render without system fonts.
 egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false }
+global-hotkey = "0.10"
 notify = "8"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
@@ -27,10 +31,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-ashpd = { version = "0.14", default-features = false, features = ["async-io", "global_shortcuts"] }
 egui_kittest = { version = "0.37", features = ["eframe"] }
-futures-util = { version = "0.3", default-features = false }
 tempfile = "3"
+# The mock GlobalShortcuts portal in tests/portal_hotkeys.rs (same zbus as ashpd).
+zbus = { version = "6", default-features = false, features = ["default-rt", "service"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
