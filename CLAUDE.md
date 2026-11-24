@@ -54,11 +54,38 @@ injects them into a chosen voice-chat application through PipeWire.
 - Tests must not need network access (serve yt-dlp test media from a local HTTP server).
 - Manual verification against real apps (Discord etc.) is done by the user.
 
+## Running checks and tests
+
+```sh
+scripts/in-container.sh scripts/check.sh          # fmt + clippy, same as CI
+scripts/in-container.sh scripts/test-headless.sh  # all tests against private D-Bus/PipeWire/WirePlumber/Xvfb
+scripts/in-container.sh scripts/test-headless.sh --test pipewire_inject -- --nocapture  # extra args go to cargo test
+scripts/in-container.sh scripts/test-headless.sh run cargo run --example inject_spike   # any command against those services
+```
+
+- `in-container.sh` builds the `soundboars-ci` image from `ci/Dockerfile` only if it's missing; after
+  changing the Dockerfile run `docker build -t soundboars-ci ci`. Container cargo state lives in
+  `.ci-cargo/`, build output shares `target/` with the host.
+- `test-headless.sh` refuses to run outside a container and sets `SOUNDBOARS_REQUIRE_PIPEWIRE=1`.
+  Tests that create PipeWire nodes/links run only when that variable is `1` (and then fail if
+  PipeWire is unreachable); a plain `cargo test` on the host skips them and never touches the
+  desktop's audio graph.
+
+## Audio threading (from milestone 1)
+
+- `audio::PipeWireService` owns a `pipewire` thread running a `MainLoop`; all PipeWire objects
+  (`!Send`) live there. Commands go in via `pipewire::channel`, `audio::Event`s come out via `std::sync::mpsc`.
+- The inject stream uses `RT_PROCESS`: its render closure (`FnMut(&mut [f32]) + Send`, interleaved
+  stereo f32 @ 48 kHz) runs on PipeWire's data thread, not the main-loop thread.
+- Node details (app name, binary, media name) are not in registry globals; recording nodes are bound
+  and their `info` (PROPS change only) is watched. Links are reconciled against a pure plan
+  (`audio::link_plan`) on every graph change; a link lives as long as its proxy (`object.linger = false`).
+
 ## Milestones
 
 | # | Milestone | Status |
 |---|---|---|
-| 1 | Docker/CI harness + spike: inject stream, list recording apps, link into one; portal shortcut registration | todo |
+| 1 | Docker/CI harness + spike: inject stream, list recording apps, link into one; portal shortcut registration | done |
 | 2 | Audio engine: decoding + cache, both streams, voices, retrigger modes, volumes, limiter | todo |
 | 3 | App UI: folder tabs, `notify`, config, target picker with auto-relink | todo |
 | 4 | Hotkeys: trait, portal backend (with Hyprland bind hints), X11 backend | todo |
