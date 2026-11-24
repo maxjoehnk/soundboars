@@ -3558,6 +3558,7 @@ dependencies = [
  "egui",
  "egui_kittest",
  "futures-util",
+ "libc",
  "notify",
  "pipewire",
  "rfd",
