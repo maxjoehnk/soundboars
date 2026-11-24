@@ -107,7 +107,8 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   count, full decode as fallback); tiles show the trimmed length (`SoundConfig::trimmed_length`).
 - `app`: `App` owns `AppState` (pure, unit-tested logic: visible sounds, play requests, progress)
   plus `Services` (`AudioBackend` = `AudioEngine` or a fake, `FolderWatcher`, `FolderPicker`,
-  `ConfigStore`). Each frame: `poll()` services → `ui::draw(&AppState) -> Vec<Action>` → `apply()`
+  `ConfigStore`, `MidiService` — started in eframe's creator closure, as it needs the
+  `egui::Context` to wake the UI). Each frame: `poll()` services → `ui::draw(&AppState) -> Vec<Action>` → `apply()`
   → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
   and emits `Action`s; it never mutates state or calls services. Settings go through
   `Action::ChangeSetting(Setting)`. `app::targets::Targets` decides auto-relinking.
@@ -129,6 +130,28 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   accessible name or kittest fails). `tests/app_smoke.rs` runs the real binary on the container's
   Xvfb (wgpu on Mesa lavapipe). Icons in labels come from egui's bundled emoji fonts
   (`egui/monochrome_emoji_fonts`); kittest panics on glyphs no bundled font has.
+
+## MIDI
+
+- `midi::MidiService` runs a `midi` thread around a `MidiInput` (`MidirInput` = ALSA sequencer via
+  `midir`, one client for listing plus one per connection; fakes in tests). It follows
+  `Settings::midi_input` (`MidiDevice::{Off, All, Port(name)}`, default `Off`) and polls the port
+  list every `HOTPLUG_POLL` (2 s); `midi::hotplug::plan` (pure) says what to connect/drop. Ports are
+  matched by their stable name (`midir`'s name without the `client:port` address,
+  `stable_port_name`). Events (`MidiEvent::{Ports, Connected, Trigger, Error}`) wake the UI
+  (`request_repaint`); errors are reported once until the same thing worked again.
+- `midi::message::Parser` (one per port): Note On with velocity > 0 triggers; CCs trigger on the
+  rising edge across 64, tracked per channel + CC; everything else is ignored. Channels are 1–16.
+- `MidiBinding { port: Option<String>, channel, control }` on `SoundConfig::midi` and
+  `Settings::midi_stop_all`; `port: None` matches any port ("Any device" in the editor). It's the
+  one config struct without `#[serde(default)]` (a binding without channel/control means nothing).
+- App side (`app/midi.rs`): `MidiState::learning` captures the next trigger instead of acting on
+  it (`Action::Midi(MidiAction::Learn(..))`; closing the window or Esc cancels). Otherwise
+  `AppState::midi_actions` turns a trigger into `Action::StopAll`/`Action::Play`, like a click.
+  UI: `ui/midi_section.rs` (editor section, settings rows, shared learn widget).
+- `tests/midi_alsa.rs` needs `/dev/snd/seq` (passed through by `in-container.sh` when the host has
+  one; the kernel sequencer isn't namespaced, so the test only touches its own virtual port) and
+  runs only inside the container; it skips otherwise.
 
 ## Tiling window managers
 
