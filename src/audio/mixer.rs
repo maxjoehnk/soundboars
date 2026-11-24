@@ -23,8 +23,10 @@ const RING_CAPACITY: usize = 256;
 /// Below this level the limiter leaves samples untouched; above it, it bends them towards ±1.
 const LIMITER_KNEE: f32 = 0.8;
 
-/// What a play does when voices of the same sound are still playing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What a play does when voices of the same sound are still playing. Stored in the config file
+/// as `"overlap"`, `"restart"` or `"stop"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Retrigger {
     /// Play another voice on top.
     #[default]

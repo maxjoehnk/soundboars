@@ -8,17 +8,29 @@ description = "A PipeWire soundboard that injects sounds into voice chat applica
 publish = false
 
 [dependencies]
+anyhow = "1"
 bytemuck = "1"
+directories = "6"
+eframe = "0.37"
+# Bundles egui's emoji/icon fonts, so the icons in labels (⟳, ⚙, ⏹, …) render without system fonts.
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+notify = "8"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 rtrb = "0.4"
 rubato = "5"
+serde = { version = "1", features = ["derive"] }
 symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4"] }
 thiserror = "2"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-anyhow = "1"
 ashpd = { version = "0.14", default-features = false, features = ["async-io", "global_shortcuts"] }
+egui_kittest = { version = "0.37", features = ["eframe"] }
 futures-util = { version = "0.3", default-features = false }
+tempfile = "3"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
