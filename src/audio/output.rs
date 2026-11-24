@@ -1,5 +1,6 @@
-//! The `soundboars-inject` output stream. It is never autoconnected; the session links it to the
-//! chosen app's recording stream.
+//! SoundBoars' output streams: `soundboars-inject`, which is never autoconnected (the session links
+//! it to the chosen app's recording stream), and `soundboars-local`, which the session manager
+//! connects to the default sink.
 
 use std::io::Cursor;
 
@@ -16,6 +17,30 @@ use super::AudioError;
 use super::format::{CHANNELS, SAMPLE_RATE};
 
 pub const INJECT_NODE_NAME: &str = "soundboars-inject";
+pub const LOCAL_NODE_NAME: &str = "soundboars-local";
+
+/// What sets the output streams apart.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamConfig {
+    pub node_name: &'static str,
+    pub description: &'static str,
+    /// Let the session manager connect the stream to the default sink.
+    pub autoconnect: bool,
+}
+
+/// Plays into the chosen app; [`super::PipeWireService`] links it.
+pub const INJECT: StreamConfig = StreamConfig {
+    node_name: INJECT_NODE_NAME,
+    description: "SoundBoars (voice chat)",
+    autoconnect: false,
+};
+
+/// Plays on the user's speakers or headphones.
+pub const LOCAL: StreamConfig = StreamConfig {
+    node_name: LOCAL_NODE_NAME,
+    description: "SoundBoars",
+    autoconnect: true,
+};
 
 const FRAME_BYTES: usize = CHANNELS * size_of::<f32>();
 
@@ -23,27 +48,29 @@ const FRAME_BYTES: usize = CHANNELS * size_of::<f32>();
 /// allocate, lock, log or block.
 pub type Render = Box<dyn FnMut(&mut [f32]) + Send>;
 
-pub struct InjectStream {
+pub struct OutputStream {
     stream: StreamRc,
     _listener: StreamListener<Render>,
 }
 
-impl InjectStream {
-    pub fn connect(core: &CoreRc, render: Render) -> Result<Self, AudioError> {
-        let stream = StreamRc::new(core.clone(), INJECT_NODE_NAME, stream_properties())?;
+impl OutputStream {
+    pub fn connect(
+        core: &CoreRc,
+        config: StreamConfig,
+        render: Render,
+    ) -> Result<Self, AudioError> {
+        let stream = StreamRc::new(core.clone(), config.node_name, stream_properties(config))?;
         let listener = stream
             .add_local_listener_with_user_data(render)
             .process(process)
             .register()?;
         let format = format_pod()?;
         let format = Pod::from_bytes(&format).ok_or(AudioError::Format)?;
-        // No AUTOCONNECT: the session decides where this stream goes.
-        stream.connect(
-            spa::utils::Direction::Output,
-            None,
-            StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
-            &mut [format],
-        )?;
+        let mut flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
+        if config.autoconnect {
+            flags |= StreamFlags::AUTOCONNECT;
+        }
+        stream.connect(spa::utils::Direction::Output, None, flags, &mut [format])?;
         Ok(Self {
             stream,
             _listener: listener,
@@ -55,15 +82,17 @@ impl InjectStream {
     }
 }
 
-fn stream_properties() -> pw::properties::PropertiesBox {
+fn stream_properties(config: StreamConfig) -> pw::properties::PropertiesBox {
     properties! {
-        *pw::keys::NODE_NAME => INJECT_NODE_NAME,
-        *pw::keys::NODE_DESCRIPTION => "SoundBoars",
+        *pw::keys::NODE_NAME => config.node_name,
+        *pw::keys::NODE_DESCRIPTION => config.description,
         *pw::keys::APP_NAME => "SoundBoars",
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::MEDIA_CLASS => "Stream/Output/Audio",
-        *pw::keys::NODE_AUTOCONNECT => "false",
+        *pw::keys::NODE_AUTOCONNECT => config.autoconnect.to_string(),
+        // Keep rendering while nothing is linked, so voices still play out and finish.
+        *pw::keys::NODE_ALWAYS_PROCESS => "true",
     }
 }
 

@@ -60,7 +60,7 @@ injects them into a chosen voice-chat application through PipeWire.
 scripts/in-container.sh scripts/check.sh          # fmt + clippy, same as CI
 scripts/in-container.sh scripts/test-headless.sh  # all tests against private D-Bus/PipeWire/WirePlumber/Xvfb
 scripts/in-container.sh scripts/test-headless.sh --test pipewire_inject -- --nocapture  # extra args go to cargo test
-scripts/in-container.sh scripts/test-headless.sh run cargo run --example inject_spike   # any command against those services
+scripts/in-container.sh scripts/test-headless.sh run cargo run --example play         # any command against those services
 ```
 
 - `in-container.sh` builds the `soundboars-ci` image from `ci/Dockerfile` only if it's missing; after
@@ -71,12 +71,22 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example inject_
   PipeWire is unreachable); a plain `cargo test` on the host skips them and never touches the
   desktop's audio graph.
 
-## Audio threading (from milestone 1)
+## Audio threading
 
+- `audio::AudioEngine` is the app's API (`Send`, every call non-blocking, results as `EngineEvent`s).
+  It runs an `audio-control` thread owning the `Controller` (sound cache, mixer handles, what's
+  playing); everything reaches it as `controller::Message`s on one `mpsc` channel (façade calls,
+  PipeWire events, decode results). It polls the mixers every 10 ms only while voices play.
 - `audio::PipeWireService` owns a `pipewire` thread running a `MainLoop`; all PipeWire objects
-  (`!Send`) live there. Commands go in via `pipewire::channel`, `audio::Event`s come out via `std::sync::mpsc`.
-- The inject stream uses `RT_PROCESS`: its render closure (`FnMut(&mut [f32]) + Send`, interleaved
-  stereo f32 @ 48 kHz) runs on PipeWire's data thread, not the main-loop thread.
+  (`!Send`) live there. Commands go in via `pipewire::channel`, `audio::Event`s go to a callback.
+- Two output streams (`audio::output`, `RT_PROCESS`, `node.always-process` so they render while
+  unlinked): `soundboars-inject` (linked to the target) and `soundboars-local` (autoconnected).
+  Each render closure is a `mixer::Mixer` on PipeWire's data thread: commands arrive via an `rtrb`
+  ring; ended voices go back (with their `Arc<[f32]>`, so the last `Arc` is never dropped on the RT
+  thread) via a second ring. Call volume is applied after the limiter and halved for targets that
+  sum both channels into one port (`link_plan::sums_channels`).
+- Decoding (`audio::decode`, symphonia + rubato) runs on the `sound-decoder` thread
+  (`loader::SoundCache`); `invalidate` drops cached sounds and discards in-flight stale decodes.
 - Node details (app name, binary, media name) are not in registry globals; recording nodes are bound
   and their `info` (PROPS change only) is watched. Links are reconciled against a pure plan
   (`audio::link_plan`) on every graph change; a link lives as long as its proxy (`object.linger = false`).
@@ -86,7 +96,7 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example inject_
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Docker/CI harness + spike: inject stream, list recording apps, link into one; portal shortcut registration | done |
-| 2 | Audio engine: decoding + cache, both streams, voices, retrigger modes, volumes, limiter | todo |
+| 2 | Audio engine: decoding + cache, both streams, voices, retrigger modes, volumes, limiter | done |
 | 3 | App UI: folder tabs, `notify`, config, target picker with auto-relink | todo |
 | 4 | Hotkeys: trait, portal backend (with Hyprland bind hints), X11 backend | todo |
 | 5 | MIDI: midir, learn mode, hotplug | todo |

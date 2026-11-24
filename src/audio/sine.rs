@@ -1,4 +1,4 @@
-//! A sine tone generator, used to test injection before the real mixer exists.
+//! A sine tone generator, used to test injection independently of the mixer.
 
 use std::f32::consts::TAU;
 

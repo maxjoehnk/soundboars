@@ -1,9 +1,8 @@
-//! Lists apps that record audio, or plays a 440 Hz sine into one of them.
+//! Lists apps that record audio, or plays a sound file into one of them (and locally).
 //!
 //! ```text
-//! cargo run --example inject_spike                          # list recording apps
-//! cargo run --example inject_spike -- --target Discord      # play into Discord for 5 s
-//! cargo run --example inject_spike -- --target Discord --seconds 10
+//! cargo run --example play                                           # list recording apps
+//! cargo run --example play -- --target Discord --file ~/airhorn.mp3  # play into Discord
 //! ```
 //!
 //! `--target` matches the process binary or the app name, case-insensitively.
@@ -12,34 +11,34 @@
     reason = "a CLI example whose output is the point"
 )]
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use soundboars::audio::sine::Sine;
-use soundboars::audio::{Event, PipeWireService, RecordingApp};
+use soundboars::audio::{AudioEngine, EngineEvent, PlayRequest, RecordingApp};
 
 /// How long to wait for the graph to settle (and for a target to appear).
 const DISCOVERY: Duration = Duration::from_secs(2);
 
 struct Args {
     target: Option<String>,
-    seconds: u64,
+    file: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
-    let mut sine = Sine::new(440.0, 0.3);
-    let service = PipeWireService::start(move |frames| sine.render(frames))?;
-    match args.target {
-        None => list_apps(&service),
-        Some(target) => play_into(&service, &target, Duration::from_secs(args.seconds)),
+    let engine = AudioEngine::start()?;
+    match (args.target, args.file) {
+        (None, _) => list_apps(&engine),
+        (Some(target), Some(file)) => play_into(&engine, &target, file),
+        (Some(_), None) => bail!("--target needs --file"),
     }
 }
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut args = Args {
         target: None,
-        seconds: 5,
+        file: None,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -48,15 +47,15 @@ fn parse_args() -> anyhow::Result<Args> {
             .with_context(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--target" => args.target = Some(value),
-            "--seconds" => args.seconds = value.parse().context("--seconds")?,
-            _ => bail!("unknown argument {flag}; use --target NAME [--seconds N]"),
+            "--file" => args.file = Some(value.into()),
+            _ => bail!("unknown argument {flag}; use [--target NAME --file PATH]"),
         }
     }
     Ok(args)
 }
 
-fn list_apps(service: &PipeWireService) -> anyhow::Result<()> {
-    let apps = collect_apps(service, |_| false);
+fn list_apps(engine: &AudioEngine) -> anyhow::Result<()> {
+    let apps = collect_apps(engine, |_| false);
     if apps.is_empty() {
         println!("No app is recording audio right now.");
     }
@@ -77,37 +76,44 @@ fn list_apps(service: &PipeWireService) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn play_into(service: &PipeWireService, target: &str, duration: Duration) -> anyhow::Result<()> {
-    let apps = collect_apps(service, |apps| apps.iter().any(|app| matches(app, target)));
+fn play_into(engine: &AudioEngine, target: &str, file: PathBuf) -> anyhow::Result<()> {
+    let apps = collect_apps(engine, |apps| apps.iter().any(|app| matches(app, target)));
     let app = apps
         .into_iter()
         .find(|app| matches(app, target))
         .with_context(|| format!("no recording app matches {target:?}"))?;
     println!(
-        "Playing 440 Hz into node {} ({}) for {duration:?}…",
-        app.node_id, app.app_name
+        "Playing {} into node {} ({})…",
+        file.display(),
+        app.node_id,
+        app.app_name
     );
-    service.link_to(app.node_id);
-    report_errors_for(service, duration);
-    service.unlink();
-    println!("Done.");
-    Ok(())
+    engine.link_to(app.node_id);
+    engine.play(PlayRequest {
+        path: file,
+        trim: None,
+        volume: 1.0,
+    });
+    let result = wait_until_finished(engine);
+    engine.unlink();
+    result
 }
 
 /// Collects the recording apps for [`DISCOVERY`], or until `enough` says so.
 fn collect_apps(
-    service: &PipeWireService,
+    engine: &AudioEngine,
     enough: impl Fn(&[RecordingApp]) -> bool,
 ) -> Vec<RecordingApp> {
     let deadline = Instant::now() + DISCOVERY;
     let mut apps = Vec::new();
-    while let Ok(event) = service
+    while let Ok(event) = engine
         .events()
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
     {
         match event {
-            Event::RecordingApps(latest) => apps = latest,
-            Event::Error(message) => println!("PipeWire error: {message}"),
+            EngineEvent::RecordingApps(latest) => apps = latest,
+            EngineEvent::Error(message) => println!("Error: {message}"),
+            _ => {}
         }
         if enough(&apps) {
             break;
@@ -116,16 +122,22 @@ fn collect_apps(
     apps
 }
 
-fn report_errors_for(service: &PipeWireService, duration: Duration) {
-    let deadline = Instant::now() + duration;
-    while let Ok(event) = service
-        .events()
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        if let Event::Error(message) = event {
-            println!("PipeWire error: {message}");
+fn wait_until_finished(engine: &AudioEngine) -> anyhow::Result<()> {
+    for event in engine.events() {
+        match event {
+            EngineEvent::Started(playing) => println!("Started, {:?} long.", playing.duration),
+            EngineEvent::Finished { .. } => {
+                println!("Done.");
+                return Ok(());
+            }
+            EngineEvent::DecodeFailed { path, error } => {
+                bail!("could not decode {}: {error}", path.display())
+            }
+            EngineEvent::Error(message) => println!("Error: {message}"),
+            EngineEvent::RecordingApps(_) => {}
         }
     }
+    bail!("the audio engine stopped")
 }
 
 fn matches(app: &RecordingApp, target: &str) -> bool {

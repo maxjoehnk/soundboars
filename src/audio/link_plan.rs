@@ -23,7 +23,7 @@ pub fn plan_links(outputs: &[Port], inputs: &[Port]) -> Vec<LinkPair> {
             outputs
                 .iter()
                 .filter(move |output| {
-                    is_single_port || input.channel == MONO || output.channel == input.channel
+                    is_single_port || is_mono(input) || output.channel == input.channel
                 })
                 .map(move |output| LinkPair {
                     output_port: output.id,
@@ -31,6 +31,16 @@ pub fn plan_links(outputs: &[Port], inputs: &[Port]) -> Vec<LinkPair> {
                 })
         })
         .collect()
+}
+
+/// Whether a target with these input ports gets several of our channels summed into one port (see
+/// [`plan_links`]), which doubles the level of a centred sound.
+pub fn sums_channels(inputs: &[Port]) -> bool {
+    inputs.len() == 1 || inputs.iter().any(is_mono)
+}
+
+fn is_mono(port: &Port) -> bool {
+    port.channel == MONO
 }
 
 #[cfg(test)]
@@ -119,5 +129,14 @@ mod tests {
             plan_links(&stereo_outputs(), &inputs),
             [pair(1, 10), pair(2, 10)]
         );
+    }
+
+    #[test]
+    fn mono_and_single_port_targets_sum_channels() {
+        assert!(sums_channels(&[port(10, "MONO")]));
+        assert!(sums_channels(&[port(10, "AUX0")]));
+        assert!(sums_channels(&[port(10, "MONO"), port(11, "FL")]));
+        assert!(!sums_channels(&[port(10, "FL"), port(11, "FR")]));
+        assert!(!sums_channels(&[]));
     }
 }

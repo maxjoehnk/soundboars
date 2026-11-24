@@ -4,7 +4,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use pipewire as pw;
@@ -20,8 +19,8 @@ use pw::types::ObjectType;
 
 use super::AudioError;
 use super::graph::{Direction, Graph, NodeProps, PortProps, RECORDING_STREAM_CLASS, RecordingApp};
-use super::inject::{InjectStream, Render};
 use super::link_plan::{LinkPair, plan_links};
+use super::output::{INJECT, LOCAL, OutputStream, Render};
 
 /// What the PipeWire thread reports back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,28 +37,39 @@ enum Command {
     Quit,
 }
 
+/// Receives the PipeWire thread's [`Event`]s, on that thread; it must not block.
+pub type EventSink = Box<dyn Fn(Event) + Send>;
+
+/// What the output streams play; see [`Render`] for the real-time rules they must follow.
+pub struct Renders {
+    /// Fills `soundboars-inject`, which goes into the linked app.
+    pub inject: Render,
+    /// Fills `soundboars-local`, which goes to the default sink.
+    pub local: Render,
+}
+
 /// Handle to the PipeWire thread. Dropping it unlinks everything and stops the thread.
 pub struct PipeWireService {
     commands: pw::channel::Sender<Command>,
-    events: mpsc::Receiver<Event>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl PipeWireService {
-    /// Connects to PipeWire on a new thread and starts the inject stream, which plays whatever
-    /// `render` produces (see [`Render`] for the real-time rules it must follow).
-    pub fn start(render: impl FnMut(&mut [f32]) + Send + 'static) -> Result<Self, AudioError> {
-        let render: Render = Box::new(render);
+    /// Connects to PipeWire on a new thread, starts both output streams and reports events to
+    /// `events`.
+    pub fn start(
+        renders: Renders,
+        events: impl Fn(Event) + Send + 'static,
+    ) -> Result<Self, AudioError> {
+        let events: EventSink = Box::new(events);
         let (command_tx, command_rx) = pw::channel::channel();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("pipewire".to_owned())
-            .spawn(move || run(render, command_rx, event_tx, ready_tx))?;
+            .spawn(move || run(renders, command_rx, events, ready_tx))?;
         ready_rx.recv().map_err(|_| AudioError::ThreadGone)??;
         Ok(Self {
             commands: command_tx,
-            events: event_rx,
             thread: Some(thread),
         })
     }
@@ -71,10 +81,6 @@ impl PipeWireService {
 
     pub fn unlink(&self) {
         self.send(Command::Unlink);
-    }
-
-    pub fn events(&self) -> &mpsc::Receiver<Event> {
-        &self.events
     }
 
     fn send(&self, command: Command) {
@@ -93,14 +99,14 @@ impl Drop for PipeWireService {
 }
 
 fn run(
-    render: Render,
+    renders: Renders,
     commands: pw::channel::Receiver<Command>,
-    events: mpsc::Sender<Event>,
-    ready: mpsc::SyncSender<Result<(), AudioError>>,
+    events: EventSink,
+    ready: std::sync::mpsc::SyncSender<Result<(), AudioError>>,
 ) {
     pw::init();
     // `ready` fails only if `start` gave up waiting, and then nobody is interested.
-    match Session::connect(render, events) {
+    match Session::connect(renders, events) {
         Ok(session) => {
             let _ = ready.send(Ok(()));
             session.run(commands);
@@ -115,28 +121,33 @@ fn run(
 struct Session {
     _registry_listener: pw::registry::Listener,
     _core_listener: pw::core::Listener,
-    _stream_listener: StreamListener<()>,
+    _inject_listener: StreamListener<()>,
+    _local_listener: StreamListener<()>,
     state: Rc<RefCell<State>>,
-    _inject: InjectStream,
+    _inject: OutputStream,
+    _local: OutputStream,
     _registry: RegistryRc,
     _context: ContextRc,
     main_loop: MainLoopRc,
 }
 
 impl Session {
-    fn connect(render: Render, events: mpsc::Sender<Event>) -> Result<Self, AudioError> {
+    fn connect(renders: Renders, events: EventSink) -> Result<Self, AudioError> {
         let main_loop = MainLoopRc::new(None)?;
         let context = ContextRc::new(&main_loop, None)?;
         let core = context.connect_rc(None)?;
         let registry = core.get_registry_rc()?;
-        let inject = InjectStream::connect(&core, render)?;
+        let inject = OutputStream::connect(&core, INJECT, renders.inject)?;
+        let local = OutputStream::connect(&core, LOCAL, renders.local)?;
         let state = Rc::new(RefCell::new(State::new(core.clone(), events)));
         Ok(Self {
             _registry_listener: watch_registry(&registry, &state),
             _core_listener: report_core_errors(&core, &state),
-            _stream_listener: watch_inject_node(&inject, &state)?,
+            _inject_listener: watch_stream(&inject, &state, State::set_inject_node)?,
+            _local_listener: watch_stream(&local, &state, |_, _| {})?,
             state,
             _inject: inject,
+            _local: local,
             _registry: registry,
             _context: context,
             main_loop,
@@ -233,13 +244,15 @@ fn report_core_errors(core: &CoreRc, state: &Rc<RefCell<State>>) -> pw::core::Li
         .register()
 }
 
-/// Our node id is known once the stream is connected; links can only be planned after that.
-fn watch_inject_node(
-    inject: &InjectStream,
+/// Reports stream errors, and calls `on_node` with the stream's node id once it's connected (links
+/// can only be planned after that).
+fn watch_stream(
+    output: &OutputStream,
     state: &Rc<RefCell<State>>,
+    on_node: impl Fn(&mut State, u32) + 'static,
 ) -> Result<StreamListener<()>, AudioError> {
     let state = Rc::downgrade(state);
-    let listener = inject
+    let listener = output
         .stream()
         .add_local_listener::<()>()
         .state_changed(move |stream, _, _old, new| {
@@ -248,7 +261,7 @@ fn watch_inject_node(
             };
             match new {
                 StreamState::Paused | StreamState::Streaming => {
-                    state.borrow_mut().set_inject_node(stream.node_id());
+                    on_node(&mut state.borrow_mut(), stream.node_id());
                 }
                 StreamState::Error(message) => state.borrow().report(message),
                 _ => {}
@@ -261,7 +274,7 @@ fn watch_inject_node(
 /// The mutable state of the PipeWire thread: the graph model, the link target and the links we own.
 struct State {
     core: CoreRc,
-    events: mpsc::Sender<Event>,
+    events: EventSink,
     graph: Graph,
     watched_nodes: HashMap<u32, (Node, NodeListener)>,
     published_apps: Vec<RecordingApp>,
@@ -272,7 +285,7 @@ struct State {
 }
 
 impl State {
-    fn new(core: CoreRc, events: mpsc::Sender<Event>) -> Self {
+    fn new(core: CoreRc, events: EventSink) -> Self {
         Self {
             core,
             events,
@@ -369,7 +382,6 @@ impl State {
     }
 
     fn send(&self, event: Event) {
-        // Fails only if the service handle is gone, and then nobody is listening anymore.
-        let _ = self.events.send(event);
+        (self.events)(event);
     }
 }
