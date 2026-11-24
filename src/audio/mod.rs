@@ -7,6 +7,7 @@ pub mod graph;
 mod inject;
 pub mod link_plan;
 pub mod loader;
+pub mod mixer;
 mod service;
 pub mod sine;
 
