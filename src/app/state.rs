@@ -10,6 +10,7 @@ use crate::library::{Library, Sound};
 
 use super::sound_editor::SoundEditor;
 use super::targets::Targets;
+use super::url_import::UrlImport;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -30,6 +31,10 @@ pub struct AppState {
     pub settings_open: bool,
     /// The "Edit sound" window, while open.
     pub editor: Option<SoundEditor>,
+    /// The "Add sound from URL" window, while open.
+    pub url_import: Option<UrlImport>,
+    /// Why sounds can't be added from URLs (e.g. yt-dlp isn't installed).
+    pub url_import_unavailable: Option<String>,
 }
 
 impl AppState {
@@ -47,6 +52,8 @@ impl AppState {
             audio_available: true,
             settings_open: false,
             editor: None,
+            url_import: None,
+            url_import_unavailable: None,
         }
     }
 

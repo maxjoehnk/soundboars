@@ -7,6 +7,7 @@ mod sound_editor;
 mod state;
 mod targets;
 mod ui;
+mod url_import;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -17,6 +18,7 @@ use eframe::egui;
 use crate::audio::decode::probe_duration;
 use crate::audio::{EngineEvent, Retrigger, Waveform};
 use crate::config::{ConfigStore, SavedTarget, Settings, TabConfig, Theme};
+use crate::import::{DownloadEvent, Downloader};
 use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
 
@@ -24,6 +26,7 @@ pub use services::{AudioBackend, FolderPicker, PortalFolderPicker};
 pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
 pub use targets::{NO_APPS_HINT, Targets};
+pub use url_import::{ImportStatus, UrlImport, UrlImportAction};
 
 /// The app ID of all windows (Wayland app ID, X11 class), and the portal's and `.desktop` file's.
 pub const APP_ID: &str = "me.maxjoehnk.soundboars";
@@ -32,7 +35,8 @@ pub const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-256.png");
 
 /// How often to look for engine and folder events while idle.
 const IDLE_POLL: Duration = Duration::from_millis(250);
-/// How often to redraw while sounds play (for their progress bars) or a waveform is loading.
+/// How often to redraw while sounds play (for their progress bars), a waveform is loading or a
+/// download runs.
 const PLAYING_REPAINT: Duration = Duration::from_millis(50);
 
 /// Something the user did.
@@ -55,6 +59,9 @@ pub enum Action {
     /// Opens the "Edit sound" window for the sound at this path.
     EditSound(PathBuf),
     Editor(EditorAction),
+    /// Opens the "Add sound from URL" window.
+    OpenUrlImport,
+    UrlImport(UrlImportAction),
 }
 
 /// A change to [`Settings`].
@@ -97,6 +104,7 @@ pub struct Services {
     pub watcher: Box<dyn FolderWatcher>,
     pub folder_picker: Box<dyn FolderPicker>,
     pub config: ConfigStore,
+    pub downloader: Box<dyn Downloader>,
 }
 
 pub struct App {
@@ -106,6 +114,7 @@ pub struct App {
     folder_picker: Box<dyn FolderPicker>,
     picked_folders: (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>),
     store: ConfigStore,
+    downloader: Box<dyn Downloader>,
     /// Measures the sounds for their tiles; `None` if its thread couldn't start.
     durations: Option<DurationProbe>,
     /// The config changed and hasn't been saved yet.
@@ -119,6 +128,7 @@ impl App {
     pub fn new(services: Services) -> Self {
         let (config, config_error) = services.config.load();
         let mut state = AppState::new(config);
+        state.url_import_unavailable = services.downloader.unavailable();
         state
             .errors
             .extend(config_error.map(|error| error.to_string()));
@@ -139,6 +149,7 @@ impl App {
             folder_picker: services.folder_picker,
             picked_folders: mpsc::channel(),
             store: services.config,
+            downloader: services.downloader,
             durations: start_duration_probe(),
             unsaved: false,
             applied_theme: None,
@@ -170,6 +181,9 @@ impl App {
         }
         while let Ok(folder) = self.picked_folders.1.try_recv() {
             self.add_tab(folder);
+        }
+        for event in self.downloader.poll() {
+            self.download_event(event);
         }
         let measured = self.durations.as_ref().map(DurationProbe::poll);
         for (path, duration) in measured.into_iter().flatten() {
@@ -203,6 +217,13 @@ impl App {
             }
             Action::EditSound(path) => self.edit_sound(&path),
             Action::Editor(action) => self.editor_action(action),
+            Action::OpenUrlImport => {
+                let tab = self.state.tab;
+                self.state
+                    .url_import
+                    .get_or_insert_with(|| UrlImport::open(tab));
+            }
+            Action::UrlImport(action) => self.url_import_action(action),
         }
     }
 
@@ -233,6 +254,41 @@ impl App {
             }
             EngineEvent::Started(_) | EngineEvent::Finished { .. } => {}
             EngineEvent::Waveform { path, waveform } => self.waveform_loaded(&path, waveform),
+        }
+    }
+
+    fn url_import_action(&mut self, action: UrlImportAction) {
+        let Some(import) = &mut self.state.url_import else {
+            return;
+        };
+        match action {
+            UrlImportAction::Download => {
+                if let Some((url, folder)) = import.start(&self.state.config.tabs) {
+                    self.downloader.start(&url, &folder);
+                }
+            }
+            UrlImportAction::Close => {
+                self.downloader.cancel();
+                self.state.url_import = None;
+            }
+            _ => import.edit(action),
+        }
+    }
+
+    fn download_event(&mut self, event: DownloadEvent) {
+        let Some(import) = &mut self.state.url_import else {
+            return;
+        };
+        match event {
+            DownloadEvent::Progress(stage) => import.status = ImportStatus::Running(stage),
+            DownloadEvent::Failed(error) => import.status = ImportStatus::Failed(error),
+            DownloadEvent::Done(path) => {
+                self.state.url_import = None;
+                if let Some(tab) = path.parent().and_then(|dir| self.state.tab_index(dir)) {
+                    self.state.select_tab(tab);
+                }
+                self.edit_sound(&path);
+            }
         }
     }
 
@@ -474,7 +530,12 @@ impl eframe::App for App {
             .state
             .editor
             .as_ref()
-            .is_some_and(|editor| editor.waveform == WaveformState::Loading);
+            .is_some_and(|editor| editor.waveform == WaveformState::Loading)
+            || self
+                .state
+                .url_import
+                .as_ref()
+                .is_some_and(UrlImport::is_running);
         ctx.request_repaint_after(if self.state.playing.is_empty() && !loading {
             IDLE_POLL
         } else {

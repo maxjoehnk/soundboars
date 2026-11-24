@@ -5,6 +5,7 @@ use eframe::egui;
 use soundboars::app::{APP_ID, App, AudioBackend, ICON_PNG, PortalFolderPicker, Services};
 use soundboars::audio::AudioEngine;
 use soundboars::config::ConfigStore;
+use soundboars::import::ytdlp::YtDlp;
 use soundboars::library::watch::NotifyWatcher;
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +23,7 @@ fn main() -> anyhow::Result<()> {
         watcher: Box::new(NotifyWatcher::new().context("could not watch folders")?),
         folder_picker: Box::new(PortalFolderPicker),
         config,
+        downloader: Box::new(YtDlp::new()),
     };
     let icon = eframe::icon_data::from_png_bytes(ICON_PNG).context("invalid window icon")?;
     let options = eframe::NativeOptions {
