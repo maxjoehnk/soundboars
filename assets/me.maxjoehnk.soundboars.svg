@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>SoundBoars</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2420"/>
+      <stop offset="1" stop-color="#1a1513"/>
+    </linearGradient>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e2763c"/>
+      <stop offset="1" stop-color="#b7410e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Soundboard pad tile -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+
+  <!-- Rust-style cog ring -->
+  <circle cx="128" cy="132" r="100" fill="none" stroke="#b7410e" stroke-width="12"
+          stroke-dasharray="10.47 10.47" opacity="0.9"/>
+  <circle cx="128" cy="132" r="90" fill="none" stroke="#b7410e" stroke-width="8" opacity="0.9"/>
+
+  <!-- Sound waves -->
+  <g fill="none" stroke="#f2c14e" stroke-width="7" stroke-linecap="round">
+    <path d="M 40 112 a 40 40 0 0 0 0 52"/>
+    <path d="M 26 100 a 58 58 0 0 0 0 76" opacity="0.6"/>
+    <path d="M 216 112 a 40 40 0 0 1 0 52"/>
+    <path d="M 230 100 a 58 58 0 0 1 0 76" opacity="0.6"/>
+  </g>
+
+  <!-- Ears -->
+  <path d="M 70 92 L 62 40 L 104 72 Z" fill="#8f3209"/>
+  <path d="M 186 92 L 194 40 L 152 72 Z" fill="#8f3209"/>
+  <path d="M 74 84 L 69 54 L 94 74 Z" fill="#e9967a"/>
+  <path d="M 182 84 L 187 54 L 162 74 Z" fill="#e9967a"/>
+
+  <!-- Head -->
+  <path d="M 128 62
+           C 170 62 194 84 192 122
+           C 190 158 172 192 128 200
+           C 84 192 66 158 64 122
+           C 62 84 86 62 128 62 Z" fill="url(#fur)"/>
+
+  <!-- Bristle crest -->
+  <path d="M 110 66 L 116 52 L 122 64 L 128 48 L 134 64 L 140 52 L 146 66 Z" fill="#8f3209"/>
+
+  <!-- Eyes (angry brows) -->
+  <path d="M 90 110 L 116 118" stroke="#2b2420" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 166 110 L 140 118" stroke="#2b2420" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="104" cy="128" r="7" fill="#1a1513"/>
+  <circle cx="152" cy="128" r="7" fill="#1a1513"/>
+  <circle cx="106" cy="126" r="2.2" fill="#fff"/>
+  <circle cx="154" cy="126" r="2.2" fill="#fff"/>
+
+  <!-- Tusks -->
+  <path d="M 100 172 C 84 170 76 156 80 140 C 86 154 94 160 106 162 Z" fill="#f5ecd7"/>
+  <path d="M 156 172 C 172 170 180 156 176 140 C 170 154 162 160 150 162 Z" fill="#f5ecd7"/>
+
+  <!-- Snout as a speaker -->
+  <ellipse cx="128" cy="166" rx="32" ry="24" fill="#e9967a"/>
+  <ellipse cx="128" cy="166" rx="24" ry="17" fill="#c96f5a"/>
+  <ellipse cx="117" cy="166" rx="6" ry="8" fill="#2b2420"/>
+  <ellipse cx="139" cy="166" rx="6" ry="8" fill="#2b2420"/>
+</svg>

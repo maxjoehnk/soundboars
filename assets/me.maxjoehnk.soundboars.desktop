@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SoundBoars
+Comment=Soundboard that injects sounds into voice chat applications
+Exec=soundboars
+Icon=me.maxjoehnk.soundboars
+Categories=AudioVideo;Audio;
+Terminal=false
+StartupWMClass=me.maxjoehnk.soundboars

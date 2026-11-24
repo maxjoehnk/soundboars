@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cargo
+            target
+          key: cargo-${{ hashFiles('Cargo.lock', 'ci/Dockerfile') }}
+          restore-keys: cargo-
+
+      - name: Build CI image
+        run: docker build -t soundboars-ci ci
+
+      - name: Lint
+        run: scripts/in-container.sh scripts/check.sh
+
+      - name: Test
+        run: scripts/in-container.sh scripts/test-headless.sh

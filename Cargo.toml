@@ -1,0 +1,24 @@
+[package]
+name = "soundboars"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A PipeWire soundboard that injects sounds into voice chat applications"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+print_stdout = "warn"
