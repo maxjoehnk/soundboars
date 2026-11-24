@@ -1,6 +1,7 @@
 //! The sound library: every tab is a folder, and its sounds are the audio files directly inside it
 //! (not in subfolders; a tab is one folder). [`watch`] reports changes to those folders.
 
+pub mod durations;
 pub mod watch;
 
 use std::fs;

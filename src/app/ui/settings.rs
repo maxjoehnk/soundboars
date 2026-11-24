@@ -1,26 +1,29 @@
-//! The settings window.
+//! The settings dialog.
 
 use eframe::egui;
 
+use super::dialog::Dialog;
 use crate::app::{Action, AppState, Setting};
 use crate::audio::Retrigger;
 use crate::config::{Settings, Theme};
 
 pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
-    let mut open = state.settings_open;
-    egui::Window::new("Settings")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            egui::Grid::new("settings")
-                .num_columns(2)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| rows(ui, &state.config.settings, actions));
-        });
-    if open != state.settings_open {
-        actions.push(Action::ShowSettings(open));
+    if !state.settings_open {
+        return;
+    }
+    let dialog = Dialog {
+        id: "settings",
+        title: "Settings",
+        size: [400.0, 90.0],
+    };
+    let closed = dialog.show(ctx, |ui| {
+        egui::Grid::new("settings")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| rows(ui, &state.config.settings, actions));
+    });
+    if closed {
+        actions.push(Action::ShowSettings(false));
     }
 }
 

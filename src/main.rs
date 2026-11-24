@@ -2,14 +2,11 @@
 
 use anyhow::Context as _;
 use eframe::egui;
-use soundboars::app::{App, AudioBackend, PortalFolderPicker, Services};
+use soundboars::app::{APP_ID, App, AudioBackend, ICON_PNG, PortalFolderPicker, Services};
 use soundboars::audio::AudioEngine;
 use soundboars::config::ConfigStore;
 use soundboars::library::watch::NotifyWatcher;
 use tracing_subscriber::EnvFilter;
-
-const APP_ID: &str = "me.maxjoehnk.soundboars";
-const ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -26,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         folder_picker: Box::new(PortalFolderPicker),
         config,
     };
-    let icon = eframe::icon_data::from_png_bytes(ICON).context("invalid window icon")?;
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG).context("invalid window icon")?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)

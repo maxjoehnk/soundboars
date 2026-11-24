@@ -68,7 +68,16 @@ fn tile(
     if response.clicked() {
         actions.push(Action::Play(sound.path.clone()));
     }
+    response.context_menu(|ui| context_menu(ui, sound, actions));
     response.on_hover_text(sound.path.display().to_string());
+}
+
+/// A tile's right-click menu.
+fn context_menu(ui: &mut egui::Ui, sound: &Sound, actions: &mut Vec<Action>) {
+    if ui.button("✏ Edit…").clicked() {
+        actions.push(Action::EditSound(sound.path.clone()));
+        ui.close();
+    }
 }
 
 fn progress_bar(ui: &egui::Ui, tile: Rect, progress: f32) {

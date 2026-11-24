@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::decode::{DecodeError, Samples};
@@ -14,6 +15,10 @@ use super::link_plan::sums_channels;
 use super::loader::{Decoded, SoundCache};
 use super::mixer::{Command, MixerHandle, Play, Retrigger, SoundId, VoiceId};
 use super::service::Event;
+use super::waveform::Waveform;
+
+/// The sound id of previews: unlike file paths, all previews count as one sound.
+const PREVIEW_SOUND: SoundId = SoundId::MAX;
 
 /// Plays a sound file.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +28,19 @@ pub struct PlayRequest {
     pub trim: Option<Trim>,
     /// The sound's own volume; `1.0` plays it as it is.
     pub volume: f32,
+    pub destination: Destination,
+}
+
+/// Where a sound plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Destination {
+    /// Into the linked app and, while local playback is enabled, locally.
+    #[default]
+    Everywhere,
+    /// Only locally (even while local playback is disabled), never into the call: the trim
+    /// editor's preview. A preview replaces the one playing; stop it with
+    /// [`Message::StopPreview`].
+    Preview,
 }
 
 /// A part of a sound file, in milliseconds from its start. Out-of-range values are clamped.
@@ -41,6 +59,7 @@ pub struct Playing {
     pub started_at: Instant,
     /// The length of the (trimmed) sound.
     pub duration: Duration,
+    pub destination: Destination,
 }
 
 impl Playing {
@@ -68,6 +87,11 @@ pub enum EngineEvent {
     Finished { voice: VoiceId, path: PathBuf },
     /// A sound could not be decoded, so it wasn't played.
     DecodeFailed { path: PathBuf, error: DecodeError },
+    /// The waveform asked for with [`Message::LoadWaveform`], or why the sound couldn't be decoded.
+    Waveform {
+        path: PathBuf,
+        waveform: Result<Waveform, String>,
+    },
 }
 
 /// Everything the control thread reacts to.
@@ -75,6 +99,8 @@ pub enum Message {
     Play(PlayRequest),
     Stop(PathBuf),
     StopAll,
+    StopPreview,
+    LoadWaveform(PathBuf),
     SetCallVolume(f32),
     SetLocalVolume(f32),
     SetLocalEnabled(bool),
@@ -108,6 +134,8 @@ pub struct Controller {
     sound_ids: HashMap<PathBuf, SoundId>,
     /// Plays waiting for their sound to be decoded.
     waiting: Vec<PlayRequest>,
+    /// Sounds whose waveform is wanted once they are decoded.
+    waiting_waveforms: Vec<PathBuf>,
     voices: HashMap<VoiceId, ActiveVoice>,
     next_voice: VoiceId,
 }
@@ -135,6 +163,7 @@ impl Controller {
             apps: Vec::new(),
             sound_ids: HashMap::new(),
             waiting: Vec::new(),
+            waiting_waveforms: Vec::new(),
             voices: HashMap::new(),
             next_voice: 0,
         }
@@ -151,6 +180,8 @@ impl Controller {
             Message::Play(request) => self.play(request),
             Message::Stop(path) => self.stop(&path),
             Message::StopAll => self.stop_all(),
+            Message::StopPreview => self.stop_preview(),
+            Message::LoadWaveform(path) => self.load_waveform(path),
             Message::SetCallVolume(volume) => {
                 self.call_volume = volume.clamp(0.0, 1.0);
                 self.update_inject_gain();
@@ -203,17 +234,65 @@ impl Controller {
         let Some(result) = self.cache.finish(decoded) else {
             return;
         };
-        let (ready, still_waiting) = std::mem::take(&mut self.waiting)
+        let (ready, still_waiting): (Vec<_>, _) = std::mem::take(&mut self.waiting)
             .into_iter()
             .partition(|request| request.path == path);
         self.waiting = still_waiting;
+        let waveform_wanted = self.waiting_waveforms.contains(&path);
+        self.waiting_waveforms.retain(|waiting| *waiting != path);
         match result {
             Ok(samples) => {
                 for request in ready {
                     self.start(request, Samples::clone(&samples));
                 }
+                if waveform_wanted {
+                    self.compute_waveform(path, samples);
+                }
             }
-            Err(error) => self.emit(EngineEvent::DecodeFailed { path, error }),
+            Err(error) => {
+                if waveform_wanted {
+                    let waveform = Err(error.to_string());
+                    let path = path.clone();
+                    self.emit(EngineEvent::Waveform { path, waveform });
+                }
+                if !ready.is_empty() {
+                    self.emit(EngineEvent::DecodeFailed { path, error });
+                }
+            }
+        }
+    }
+
+    fn load_waveform(&mut self, path: PathBuf) {
+        match self.cache.get(&path) {
+            Some(samples) => {
+                let samples = Samples::clone(samples);
+                self.compute_waveform(path, samples);
+            }
+            None => {
+                self.cache.load(&path);
+                self.waiting_waveforms.push(path);
+            }
+        }
+    }
+
+    /// Computes the waveform on a thread of its own: it takes a pass over the whole sound, which
+    /// would hold up the control thread.
+    fn compute_waveform(&self, path: PathBuf, samples: Samples) {
+        let events = self.events.clone();
+        let thread_path = path.clone();
+        let spawned = thread::Builder::new()
+            .name("waveform".to_owned())
+            .spawn(move || {
+                let waveform = Ok(Waveform::of(&samples));
+                // Fails only if the engine is gone, and then nobody is listening anymore.
+                let _ = events.send(EngineEvent::Waveform {
+                    path: thread_path,
+                    waveform,
+                });
+            });
+        if let Err(error) = spawned {
+            let waveform = Err(format!("could not start a thread: {error}"));
+            self.emit(EngineEvent::Waveform { path, waveform });
         }
     }
 
@@ -221,19 +300,20 @@ impl Controller {
         let (start_frame, end_frame) = trim_frames(request.trim, samples.len() / CHANNELS);
         let voice = self.next_voice;
         self.next_voice += 1;
+        let (sound_id, retrigger) = match request.destination {
+            Destination::Everywhere => (self.sound_id(&request.path), self.retrigger),
+            Destination::Preview => (PREVIEW_SOUND, Retrigger::Restart),
+        };
         let play = Play {
             voice_id: voice,
-            sound_id: self.sound_id(&request.path),
+            sound_id,
             samples,
             start_frame,
             end_frame,
             gain: request.volume.max(0.0),
-            retrigger: self.retrigger,
+            retrigger,
         };
-        let mut mixers = u8::from(self.send_inject(Command::Play(play.clone())));
-        if self.local_enabled {
-            mixers += u8::from(self.send_local(Command::Play(play)));
-        }
+        let mixers = self.send_play(play, request.destination);
         if mixers == 0 {
             return;
         }
@@ -242,6 +322,7 @@ impl Controller {
             path: request.path,
             started_at: Instant::now(),
             duration: frames_to_duration(end_frame - start_frame),
+            destination: request.destination,
         };
         self.voices.insert(
             voice,
@@ -252,6 +333,20 @@ impl Controller {
         );
         self.publish_playing();
         self.emit(EngineEvent::Started(playing));
+    }
+
+    /// Sends `play` to the mixers of `destination`; returns how many took it.
+    fn send_play(&mut self, play: Play, destination: Destination) -> u8 {
+        match destination {
+            Destination::Everywhere => {
+                let mut mixers = u8::from(self.send_inject(Command::Play(play.clone())));
+                if self.local_enabled {
+                    mixers += u8::from(self.send_local(Command::Play(play)));
+                }
+                mixers
+            }
+            Destination::Preview => u8::from(self.send_local(Command::Play(play))),
+        }
     }
 
     fn stop(&mut self, path: &Path) {
@@ -268,6 +363,12 @@ impl Controller {
         self.send_local(Command::StopAll);
     }
 
+    fn stop_preview(&mut self) {
+        self.waiting
+            .retain(|request| request.destination != Destination::Preview);
+        self.send_local(Command::Stop(PREVIEW_SOUND));
+    }
+
     fn set_local_enabled(&mut self, enabled: bool) {
         self.local_enabled = enabled;
         if !enabled {
@@ -277,7 +378,9 @@ impl Controller {
 
     fn invalidate(&mut self, path: &Path) {
         self.cache.invalidate(path);
-        if self.waiting.iter().any(|request| request.path == path) {
+        let waited_for = self.waiting.iter().any(|request| request.path == path)
+            || self.waiting_waveforms.iter().any(|waiting| waiting == path);
+        if waited_for {
             self.cache.load(path);
         }
     }
@@ -503,6 +606,7 @@ mod tests {
                 path: path.into(),
                 trim,
                 volume: 0.5,
+                destination: Destination::Everywhere,
             }));
             self.finish_decode();
         }
@@ -555,6 +659,7 @@ mod tests {
             path: "a.wav".into(),
             trim: None,
             volume: 1.0,
+            destination: Destination::Everywhere,
         }));
         assert_eq!(fixture.inject.plays().len(), 2);
     }
@@ -638,6 +743,7 @@ mod tests {
             path: "a.wav".into(),
             trim: None,
             volume: 1.0,
+            destination: Destination::Everywhere,
         }));
         fixture.send(Message::Stop("a.wav".into()));
         fixture.finish_decode();
@@ -696,6 +802,108 @@ mod tests {
         ));
     }
 
+    fn preview(path: &str) -> Message {
+        Message::Play(PlayRequest {
+            path: path.into(),
+            trim: Some(Trim {
+                start_ms: 250,
+                end_ms: None,
+            }),
+            volume: 0.8,
+            destination: Destination::Preview,
+        })
+    }
+
+    #[test]
+    fn previews_play_only_locally_even_with_local_playback_disabled() {
+        let mut fixture = Fixture::new();
+        fixture.send(Message::SetLocalEnabled(false));
+        fixture.local.commands();
+        fixture.send(preview("a.wav"));
+        fixture.finish_decode();
+
+        assert!(fixture.inject.plays().is_empty());
+        let local = fixture.local.plays();
+        let [play] = &local[..] else {
+            panic!("{local:?}");
+        };
+        assert_eq!((play.start_frame, play.gain), (12_000, 0.8));
+        assert_eq!(play.retrigger, Retrigger::Restart);
+        assert_eq!(fixture.playing()[0].destination, Destination::Preview);
+
+        fixture.local.finish(play.clone());
+        fixture.controller.poll_mixers();
+        assert!(!fixture.controller.has_voices(), "one mixer is enough");
+    }
+
+    #[test]
+    fn previews_are_a_sound_of_their_own() {
+        let mut fixture = Fixture::new();
+        fixture.send(Message::SetRetrigger(Retrigger::Stop));
+        fixture.play("a.wav", None);
+        fixture.send(preview("a.wav"));
+        let plays = fixture.local.plays();
+        let [board, preview] = &plays[..] else {
+            panic!("{plays:?}");
+        };
+        assert_ne!(preview.sound_id, board.sound_id);
+
+        fixture.send(Message::StopPreview);
+        let inject = fixture.inject.commands();
+        assert!(
+            !inject
+                .iter()
+                .any(|command| matches!(command, Command::Stop(_) | Command::StopAll)),
+            "{inject:?}"
+        );
+        assert!(
+            matches!(fixture.local.commands()[..], [Command::Stop(id)] if id == preview.sound_id)
+        );
+    }
+
+    #[test]
+    fn stopping_the_preview_cancels_a_pending_one() {
+        let mut fixture = Fixture::new();
+        fixture.send(preview("a.wav"));
+        fixture.send(Message::StopPreview);
+        fixture.finish_decode();
+        assert!(fixture.local.plays().is_empty());
+    }
+
+    fn waveform_event(fixture: &Fixture) -> (PathBuf, Result<Waveform, String>) {
+        loop {
+            match fixture.events.recv_timeout(TIMEOUT).expect("a waveform") {
+                EngineEvent::Waveform { path, waveform } => return (path, waveform),
+                _ => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn waveforms_come_from_the_decoded_sound() {
+        let mut fixture = Fixture::new();
+        fixture.send(Message::LoadWaveform("a.wav".into()));
+        fixture.finish_decode();
+        let (path, waveform) = waveform_event(&fixture);
+        assert_eq!(path, Path::new("a.wav"));
+        assert_eq!(waveform.expect("decodes").duration, Duration::from_secs(1));
+
+        // Now it's cached: no second decode.
+        fixture.send(Message::LoadWaveform("a.wav".into()));
+        assert!(waveform_event(&fixture).1.is_ok());
+        assert!(fixture.decoded.try_recv().is_err());
+    }
+
+    #[test]
+    fn waveforms_of_undecodable_sounds_are_errors() {
+        let mut fixture = Fixture::new();
+        fixture.send(Message::LoadWaveform("bad.wav".into()));
+        fixture.finish_decode();
+        let (_, waveform) = waveform_event(&fixture);
+        assert!(waveform.is_err());
+        assert!(fixture.events().is_empty(), "no play failed");
+    }
+
     #[test]
     fn progress_runs_from_zero_to_one() {
         let start = Instant::now();
@@ -704,6 +912,7 @@ mod tests {
             path: "a.wav".into(),
             started_at: start,
             duration: Duration::from_secs(2),
+            destination: Destination::Everywhere,
         };
         assert_eq!(playing.progress(start), 0.0);
         assert_eq!(playing.progress(start + Duration::from_secs(1)), 0.5);

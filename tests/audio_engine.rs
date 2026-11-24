@@ -11,7 +11,9 @@ use common::{
     FAKE_BINARY, HEADLESS_SINK, Recorder, TIMEOUT, assert_tone, fixture, peak, temp_wav,
     wait_for_links,
 };
-use soundboars::audio::{AudioEngine, EngineEvent, INJECT_NODE_NAME, PlayRequest, RecordingApp};
+use soundboars::audio::{
+    AudioEngine, Destination, EngineEvent, INJECT_NODE_NAME, PlayRequest, RecordingApp, waveform,
+};
 
 /// The tests watch the whole graph (links, the sink's output), so they must not run concurrently.
 static GRAPH: Mutex<()> = Mutex::new(());
@@ -29,7 +31,7 @@ fn plays_a_file_into_the_app_and_on_the_default_sink() {
     let engine = start_engine();
     let recorders = Recorders::start_and_link(&engine, "plays");
 
-    play_and_wait(&engine, "tone.flac");
+    play_and_wait(&engine, request("tone.flac"));
 
     let (app, local) = recorders.stop_and_read();
     assert_tone("app", &app, TONE_HZ, MIN_TONE_SECONDS);
@@ -49,7 +51,7 @@ fn call_volume_zero_silences_the_app_but_not_local_playback() {
     engine.set_call_volume(0.0);
     let recorders = Recorders::start_and_link(&engine, "volume");
 
-    play_and_wait(&engine, "tone.mp3");
+    play_and_wait(&engine, request("tone.mp3"));
 
     let (app, local) = recorders.stop_and_read();
     assert!(peak(&app) < 0.01, "app peak {}", peak(&app));
@@ -65,8 +67,56 @@ fn sounds_finish_without_a_linked_app() {
     let engine = start_engine();
     engine.set_local_enabled(false);
     // The inject stream isn't linked anywhere, yet it must keep rendering so the sound finishes.
-    play_and_wait(&engine, "tone.ogg");
+    play_and_wait(&engine, request("tone.ogg"));
     assert!(engine.playing().is_empty());
+}
+
+#[test]
+fn previews_play_locally_but_never_into_the_app() {
+    if !common::pipewire_required() {
+        return;
+    }
+    let _graph = GRAPH.lock().unwrap_or_else(PoisonError::into_inner);
+    let engine = start_engine();
+    // Previews ignore whether local playback is enabled.
+    engine.set_local_enabled(false);
+    let recorders = Recorders::start_and_link(&engine, "preview");
+
+    play_and_wait(
+        &engine,
+        PlayRequest {
+            destination: Destination::Preview,
+            ..request("tone.flac")
+        },
+    );
+
+    let (app, local) = recorders.stop_and_read();
+    assert!(peak(&app) < 0.01, "app peak {}", peak(&app));
+    assert_tone("local", &local, TONE_HZ, MIN_TONE_SECONDS);
+}
+
+#[test]
+fn waveforms_are_computed_from_the_file() {
+    if !common::pipewire_required() {
+        return;
+    }
+    let _graph = GRAPH.lock().unwrap_or_else(PoisonError::into_inner);
+    let engine = start_engine();
+    engine.load_waveform(&fixture("tone.flac"));
+    let event = wait_for(&engine, |event| {
+        matches!(event, EngineEvent::Waveform { .. })
+    });
+    let EngineEvent::Waveform { waveform, .. } = event else {
+        unreachable!("wait_for returned a Waveform event");
+    };
+    let waveform = waveform.expect("decodes");
+    assert_eq!(waveform.peaks.len(), waveform::BUCKETS);
+    assert!((0.45..0.55).contains(&waveform.duration.as_secs_f32()));
+    let loudest = waveform
+        .peaks
+        .iter()
+        .fold(0.0f32, |loudest, peak| loudest.max(peak.max));
+    assert!((0.4..0.6).contains(&loudest), "peak {loudest}");
 }
 
 #[test]
@@ -92,12 +142,13 @@ fn request(name: &str) -> PlayRequest {
         path: fixture(name),
         trim: None,
         volume: 1.0,
+        destination: Destination::Everywhere,
     }
 }
 
-/// Plays a fixture and waits until it has started and finished.
-fn play_and_wait(engine: &AudioEngine, name: &str) {
-    engine.play(request(name));
+/// Plays a sound and waits until it has started and finished.
+fn play_and_wait(engine: &AudioEngine, request: PlayRequest) {
+    engine.play(request);
     let started = wait_for(engine, |event| matches!(event, EngineEvent::Started(_)));
     let EngineEvent::Started(playing) = started else {
         unreachable!("wait_for returned a Started event");

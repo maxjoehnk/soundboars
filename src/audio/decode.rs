@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
@@ -55,18 +56,46 @@ struct Decoded {
     rate: u32,
 }
 
-fn decode_interleaved(path: &Path) -> Result<Decoded, DecodeError> {
+/// The length of the sound at `path`: from the frame count in its container if there is one
+/// (cheap), else by decoding it.
+pub fn probe_duration(path: &Path) -> Result<Duration, DecodeError> {
+    let format = open(path)?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or(DecodeError::NoAudioTrack)?;
+    let rate = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .and_then(|params| params.sample_rate)
+        .filter(|&rate| rate > 0);
+    if let (Some(frames), Some(rate)) = (track.num_frames, rate) {
+        return Ok(Duration::from_secs_f64(frames as f64 / f64::from(rate)));
+    }
+    let samples = decode_file(path)?;
+    let frames = samples.len() / CHANNELS;
+    Ok(Duration::from_secs_f64(
+        frames as f64 / f64::from(SAMPLE_RATE),
+    ))
+}
+
+fn open(path: &Path) -> Result<Box<dyn FormatReader>, DecodeError> {
     let source = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(extension);
     }
-    let mut format = symphonia::default::get_probe().probe(
+    let format = symphonia::default::get_probe().probe(
         &hint,
         source,
         FormatOptions::default(),
         MetadataOptions::default(),
     )?;
+    Ok(format)
+}
+
+fn decode_interleaved(path: &Path) -> Result<Decoded, DecodeError> {
+    let mut format = open(path)?;
     let track = format
         .default_track(TrackType::Audio)
         .ok_or(DecodeError::NoAudioTrack)?;
@@ -253,6 +282,27 @@ mod tests {
     fn a_missing_file_is_an_io_error() {
         let error = decode_file(&fixture("missing.wav")).expect_err("missing");
         assert!(matches!(error, DecodeError::Io(_)), "{error:?}");
+    }
+
+    #[test]
+    fn every_fixture_format_reports_its_length() {
+        for name in [
+            "tone-44k-mono.wav",
+            "tone.mp3",
+            "tone.flac",
+            "tone.ogg",
+            "tone.m4a",
+        ] {
+            let seconds = probe_duration(&fixture(name)).expect(name).as_secs_f32();
+            // Lossy codecs add encoder delay and padding.
+            assert!((0.45..0.6).contains(&seconds), "{name}: {seconds} s");
+        }
+    }
+
+    #[test]
+    fn probing_files_that_are_not_audio_fails() {
+        assert!(probe_duration(&fixture("not-audio.mp3")).is_err());
+        assert!(probe_duration(&fixture("missing.wav")).is_err());
     }
 
     #[test]

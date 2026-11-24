@@ -62,8 +62,9 @@ impl AudioEngine {
         })
     }
 
-    /// Plays a sound on both streams. A sound that isn't decoded yet is decoded in the background
-    /// first; [`EngineEvent::DecodeFailed`] reports if that fails.
+    /// Plays a sound on the streams of its [`PlayRequest::destination`]. A sound that isn't
+    /// decoded yet is decoded in the background first; [`EngineEvent::DecodeFailed`] reports if
+    /// that fails.
     pub fn play(&self, request: PlayRequest) {
         self.send(Message::Play(request));
     }
@@ -75,6 +76,17 @@ impl AudioEngine {
 
     pub fn stop_all(&self) {
         self.send(Message::StopAll);
+    }
+
+    /// Stops the playing [`Destination::Preview`](super::Destination::Preview), if any.
+    pub fn stop_preview(&self) {
+        self.send(Message::StopPreview);
+    }
+
+    /// Computes the waveform of the sound at `path` in the background (decoding it first if
+    /// needed); it arrives as [`EngineEvent::Waveform`].
+    pub fn load_waveform(&self, path: &Path) {
+        self.send(Message::LoadWaveform(path.to_owned()));
     }
 
     /// Volume of what the linked app receives, `0.0..=1.0`.

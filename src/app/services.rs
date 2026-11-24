@@ -11,6 +11,8 @@ use crate::audio::{AudioEngine, EngineEvent, PlayRequest, Playing, Retrigger};
 pub trait AudioBackend {
     fn play(&self, request: PlayRequest);
     fn stop_all(&self);
+    fn stop_preview(&self);
+    fn load_waveform(&self, path: &Path);
     fn set_call_volume(&self, volume: f32);
     fn set_local_volume(&self, volume: f32);
     fn set_local_enabled(&self, enabled: bool);
@@ -30,6 +32,14 @@ impl AudioBackend for AudioEngine {
 
     fn stop_all(&self) {
         AudioEngine::stop_all(self);
+    }
+
+    fn stop_preview(&self) {
+        AudioEngine::stop_preview(self);
+    }
+
+    fn load_waveform(&self, path: &Path) {
+        AudioEngine::load_waveform(self, path);
     }
 
     fn set_call_volume(&self, volume: f32) {

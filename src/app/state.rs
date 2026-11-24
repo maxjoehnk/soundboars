@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::audio::{PlayRequest, Playing};
-use crate::config::Config;
+use crate::audio::{Destination, PlayRequest, Playing};
+use crate::config::{Config, SoundConfig};
 use crate::library::{Library, Sound};
 
+use super::sound_editor::SoundEditor;
 use super::targets::Targets;
 
 #[derive(Debug)]
@@ -22,11 +23,13 @@ pub struct AppState {
     pub errors: Vec<String>,
     /// What plays right now, refreshed every frame.
     pub playing: Vec<Playing>,
-    /// The (trimmed) length of sounds that played before.
+    /// The lengths of the (untrimmed) sound files, once known.
     pub durations: HashMap<PathBuf, Duration>,
     /// `false` when PipeWire isn't available: nothing can be played or linked.
     pub audio_available: bool,
     pub settings_open: bool,
+    /// The "Edit sound" window, while open.
+    pub editor: Option<SoundEditor>,
 }
 
 impl AppState {
@@ -43,6 +46,7 @@ impl AppState {
             durations: HashMap::new(),
             audio_available: true,
             settings_open: false,
+            editor: None,
         }
     }
 
@@ -65,19 +69,53 @@ impl AppState {
 
     /// Plays the sound at `path` with its volume and trim from the config.
     pub fn play_request(&self, path: &Path) -> Option<PlayRequest> {
+        let meta = self.sound_config(path)?;
+        Some(PlayRequest {
+            path: path.to_owned(),
+            trim: meta.trim(),
+            volume: meta.volume,
+            destination: Destination::Everywhere,
+        })
+    }
+
+    /// The saved metadata of the sound at `path` (defaults if there is none yet).
+    pub fn sound_config(&self, path: &Path) -> Option<SoundConfig> {
         let (tab, sound) = self.library.find(path)?;
         let meta = self.config.tabs.get(tab)?.sounds.get(&sound.key);
-        Some(PlayRequest {
-            path: sound.path.clone(),
-            trim: meta.and_then(|meta| meta.trim()),
-            volume: meta.map_or(1.0, |meta| meta.volume),
-        })
+        Some(meta.cloned().unwrap_or_default())
+    }
+
+    /// The metadata of the sound at `path` to change, created with defaults if missing.
+    pub fn sound_config_mut(&mut self, path: &Path) -> Option<&mut SoundConfig> {
+        let (tab, sound) = self.library.find(path)?;
+        let key = sound.key.clone();
+        Some(
+            self.config
+                .tabs
+                .get_mut(tab)?
+                .sounds
+                .entry(key)
+                .or_default(),
+        )
+    }
+
+    /// The board's sounds that play right now, without previews.
+    fn playing_on_board(&self) -> impl Iterator<Item = &Playing> {
+        self.playing
+            .iter()
+            .filter(|playing| playing.destination == Destination::Everywhere)
+    }
+
+    /// The preview of the sound at `path`, while it plays.
+    pub fn preview(&self, path: &Path) -> Option<&Playing> {
+        self.playing
+            .iter()
+            .rfind(|playing| playing.destination == Destination::Preview && playing.path == path)
     }
 
     /// How far the most recently started voice of `path` is, if it plays.
     pub fn progress(&self, path: &Path, now: Instant) -> Option<f32> {
-        self.playing
-            .iter()
+        self.playing_on_board()
             .filter(|playing| playing.path == path)
             .map(|playing| playing.progress(now))
             .reduce(f32::min)
@@ -85,8 +123,7 @@ impl AppState {
 
     /// The names of the playing sounds, oldest first.
     pub fn now_playing(&self) -> Vec<String> {
-        self.playing
-            .iter()
+        self.playing_on_board()
             .map(|playing| match self.library.find(&playing.path) {
                 Some((_, sound)) => sound.name.clone(),
                 None => file_stem(&playing.path),
@@ -94,11 +131,12 @@ impl AppState {
             .collect()
     }
 
-    /// The second line of a tile: the length once known, else the file format.
+    /// The second line of a tile: the trimmed length once known, else the file format.
     pub fn subtitle(&self, sound: &Sound) -> String {
-        match self.durations.get(&sound.path) {
-            Some(duration) => format_duration(*duration),
-            None => sound.format(),
+        let length = self.durations.get(&sound.path);
+        match (length, self.sound_config(&sound.path)) {
+            (Some(&length), Some(meta)) => format_duration(meta.trimmed_length(length)),
+            _ => sound.format(),
         }
     }
 
@@ -131,7 +169,7 @@ mod tests {
 
     use super::*;
     use crate::audio::Trim;
-    use crate::config::{SoundConfig, TabConfig};
+    use crate::config::TabConfig;
 
     struct Fixture {
         _dirs: [tempfile::TempDir; 2],
@@ -217,6 +255,7 @@ mod tests {
                     end_ms: Some(900)
                 }),
                 volume: 0.5,
+                destination: Destination::Everywhere,
             })
         );
         assert_eq!(
@@ -225,9 +264,20 @@ mod tests {
                 path: bruh,
                 trim: None,
                 volume: 1.0,
+                destination: Destination::Everywhere,
             })
         );
         assert_eq!(f.state.play_request(Path::new("/gone.wav")), None);
+    }
+
+    #[test]
+    fn sound_metadata_is_created_on_first_change() {
+        let mut f = fixture();
+        let bruh = f.state.visible_sounds()[1].path.clone();
+        assert_eq!(f.state.sound_config(&bruh), Some(SoundConfig::default()));
+        f.state.sound_config_mut(&bruh).expect("in a tab").volume = 0.3;
+        assert_eq!(f.state.config.tabs[0].sounds["Bruh.wav"].volume, 0.3);
+        assert!(f.state.sound_config_mut(Path::new("/gone.wav")).is_none());
     }
 
     #[test]
@@ -235,30 +285,43 @@ mod tests {
         let mut f = fixture();
         let airhorn = f.state.visible_sounds()[0].path.clone();
         let now = Instant::now();
-        let voice = |voice, started_at| Playing {
+        let voice = |voice, started_at, destination| Playing {
             voice,
             path: airhorn.clone(),
             started_at,
             duration: Duration::from_secs(4),
+            destination,
         };
         f.state.playing = vec![
-            voice(0, now - Duration::from_secs(3)),
-            voice(1, now - Duration::from_secs(1)),
+            voice(0, now - Duration::from_secs(3), Destination::Everywhere),
+            voice(1, now - Duration::from_secs(1), Destination::Everywhere),
+            voice(2, now, Destination::Preview),
         ];
 
         assert_eq!(f.state.progress(&airhorn, now), Some(0.25));
         assert_eq!(f.state.progress(Path::new("/other.wav"), now), None);
         assert_eq!(f.state.now_playing(), ["Airhorn", "Airhorn"]);
+        assert_eq!(
+            f.state.preview(&airhorn).map(|preview| preview.voice),
+            Some(2)
+        );
     }
 
     #[test]
     fn subtitles_show_the_length_once_known() {
         let mut f = fixture();
-        let sound = f.state.visible_sounds()[0].clone();
-        assert_eq!(f.state.subtitle(&sound), "MP3");
-        f.state
-            .durations
-            .insert(sound.path.clone(), Duration::from_millis(62_500));
-        assert_eq!(f.state.subtitle(&sound), "1:02.50");
+        let [airhorn, bruh] = [0, 1].map(|index| f.state.visible_sounds()[index].clone());
+        assert_eq!(f.state.subtitle(&airhorn), "MP3");
+        for sound in [&airhorn, &bruh] {
+            f.state
+                .durations
+                .insert(sound.path.clone(), Duration::from_millis(62_500));
+        }
+        assert_eq!(f.state.subtitle(&bruh), "1:02.50");
+        assert_eq!(
+            f.state.subtitle(&airhorn),
+            "0:00.80",
+            "trimmed to 0.1–0.9 s"
+        );
     }
 }

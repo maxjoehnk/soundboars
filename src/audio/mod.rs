@@ -13,14 +13,16 @@ pub mod mixer;
 mod output;
 mod service;
 pub mod sine;
+pub mod waveform;
 
-pub use controller::{EngineEvent, PlayRequest, Playing, Trim};
+pub use controller::{Destination, EngineEvent, PlayRequest, Playing, Trim};
 pub use engine::AudioEngine;
 pub use format::{CHANNELS, SAMPLE_RATE};
 pub use graph::{Port, RecordingApp};
 pub use mixer::{Retrigger, VoiceId};
 pub use output::{INJECT_NODE_NAME, LOCAL_NODE_NAME, Render};
 pub use service::{Event, PipeWireService, Renders};
+pub use waveform::{Peak, Waveform};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {

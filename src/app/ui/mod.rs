@@ -2,7 +2,9 @@
 
 mod board;
 mod bottom_bar;
+mod dialog;
 mod settings;
+mod sound_editor;
 mod top_bar;
 
 use eframe::egui;
@@ -16,6 +18,7 @@ pub fn draw(ui: &mut egui::Ui, state: &AppState) -> Vec<Action> {
     bottom_bar::show(ui, state, &mut actions);
     egui::CentralPanel::default().show(ui, |ui| board::show(ui, state, &mut actions));
     settings::show(ui.ctx(), state, &mut actions);
+    sound_editor::show(ui.ctx(), state, &mut actions);
     actions
 }
 

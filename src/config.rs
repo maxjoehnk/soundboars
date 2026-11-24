@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +144,15 @@ impl SoundConfig {
             end_ms: self.end_ms,
         })
     }
+
+    /// How long the trimmed part of a sound of `length` is.
+    pub fn trimmed_length(&self, length: Duration) -> Duration {
+        let end = self
+            .end_ms
+            .map_or(length, Duration::from_millis)
+            .min(length);
+        end.saturating_sub(Duration::from_millis(self.start_ms))
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -264,6 +274,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = ConfigStore::new(dir.path().join("sub/config.toml"));
         (dir, store)
+    }
+
+    #[test]
+    fn trimmed_length_is_clamped_to_the_sound() {
+        let length = Duration::from_millis(1_000);
+        let trimmed = |start_ms, end_ms| {
+            let meta = SoundConfig {
+                start_ms,
+                end_ms,
+                ..SoundConfig::default()
+            };
+            meta.trimmed_length(length).as_millis()
+        };
+        assert_eq!(trimmed(0, None), 1_000);
+        assert_eq!(trimmed(250, Some(750)), 500);
+        assert_eq!(trimmed(250, Some(5_000)), 750);
+        assert_eq!(trimmed(5_000, None), 0);
     }
 
     fn sample() -> Config {

@@ -3,6 +3,7 @@
 //! changes state or talks to services itself.
 
 mod services;
+mod sound_editor;
 mod state;
 mod targets;
 mod ui;
@@ -13,17 +14,25 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::audio::{EngineEvent, Retrigger};
+use crate::audio::decode::probe_duration;
+use crate::audio::{EngineEvent, Retrigger, Waveform};
 use crate::config::{ConfigStore, SavedTarget, Settings, TabConfig, Theme};
+use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
 
 pub use services::{AudioBackend, FolderPicker, PortalFolderPicker};
+pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
 pub use targets::{NO_APPS_HINT, Targets};
 
+/// The app ID of all windows (Wayland app ID, X11 class), and the portal's and `.desktop` file's.
+pub const APP_ID: &str = "me.maxjoehnk.soundboars";
+/// The window icon.
+pub const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-256.png");
+
 /// How often to look for engine and folder events while idle.
 const IDLE_POLL: Duration = Duration::from_millis(250);
-/// How often to redraw while sounds play, for their progress bars.
+/// How often to redraw while sounds play (for their progress bars) or a waveform is loading.
 const PLAYING_REPAINT: Duration = Duration::from_millis(50);
 
 /// Something the user did.
@@ -43,6 +52,9 @@ pub enum Action {
     ChangeSetting(Setting),
     ShowSettings(bool),
     DismissError(usize),
+    /// Opens the "Edit sound" window for the sound at this path.
+    EditSound(PathBuf),
+    Editor(EditorAction),
 }
 
 /// A change to [`Settings`].
@@ -94,6 +106,8 @@ pub struct App {
     folder_picker: Box<dyn FolderPicker>,
     picked_folders: (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>),
     store: ConfigStore,
+    /// Measures the sounds for their tiles; `None` if its thread couldn't start.
+    durations: Option<DurationProbe>,
     /// The config changed and hasn't been saved yet.
     unsaved: bool,
     applied_theme: Option<Theme>,
@@ -125,10 +139,12 @@ impl App {
             folder_picker: services.folder_picker,
             picked_folders: mpsc::channel(),
             store: services.config,
+            durations: start_duration_probe(),
             unsaved: false,
             applied_theme: None,
         };
         app.watch_tabs();
+        app.measure_sounds();
         app.apply_settings();
         for error in &app.state.errors {
             tracing::warn!("{error}");
@@ -155,6 +171,15 @@ impl App {
         while let Ok(folder) = self.picked_folders.1.try_recv() {
             self.add_tab(folder);
         }
+        let measured = self.durations.as_ref().map(DurationProbe::poll);
+        for (path, duration) in measured.into_iter().flatten() {
+            match duration {
+                Ok(duration) => {
+                    self.state.durations.insert(path, duration);
+                }
+                Err(error) => tracing::debug!("no length for {}: {error}", path.display()),
+            }
+        }
     }
 
     pub fn apply(&mut self, action: Action) {
@@ -176,6 +201,8 @@ impl App {
                     self.state.errors.remove(index);
                 }
             }
+            Action::EditSound(path) => self.edit_sound(&path),
+            Action::Editor(action) => self.editor_action(action),
         }
     }
 
@@ -204,18 +231,85 @@ impl App {
             EngineEvent::DecodeFailed { path, error } => {
                 self.show_error(format!("Could not play {}: {error}", path.display()));
             }
-            EngineEvent::Started(playing) => {
-                self.state.durations.insert(playing.path, playing.duration);
+            EngineEvent::Started(_) | EngineEvent::Finished { .. } => {}
+            EngineEvent::Waveform { path, waveform } => self.waveform_loaded(&path, waveform),
+        }
+    }
+
+    fn edit_sound(&mut self, path: &Path) {
+        if self.state.library.find(path).is_none() {
+            // E.g. a file that was just downloaded, before the folder watcher reported it.
+            self.state.library.changed(path);
+            self.measure_sounds();
+        }
+        let Some(saved) = self.state.sound_config(path) else {
+            self.show_error(format!("{} is not in any tab", path.display()));
+            return;
+        };
+        self.close_editor();
+        let mut editor = SoundEditor::open(path, &saved);
+        match &self.audio {
+            Some(audio) => audio.load_waveform(path),
+            None => editor.waveform_loaded(Err("no audio".to_owned())),
+        }
+        self.state.editor = Some(editor);
+    }
+
+    fn editor_action(&mut self, action: EditorAction) {
+        let Some(editor) = &mut self.state.editor else {
+            return;
+        };
+        match action {
+            EditorAction::Preview => {
+                let request = editor.preview_request();
+                self.with_audio(|audio| audio.play(request));
             }
-            EngineEvent::Finished { .. } => {}
+            EditorAction::StopPreview => self.with_audio(|audio| audio.stop_preview()),
+            EditorAction::Save => self.save_editor(),
+            EditorAction::Close => self.close_editor(),
+            _ => editor.apply(action),
+        }
+    }
+
+    fn waveform_loaded(&mut self, path: &Path, waveform: Result<Waveform, String>) {
+        if let Some(editor) = &mut self.state.editor
+            && editor.path == path
+        {
+            editor.waveform_loaded(waveform);
+        }
+    }
+
+    /// Writes the editor's changes into the config and closes it.
+    fn save_editor(&mut self) {
+        let Some(editor) = self.state.editor.clone() else {
+            return;
+        };
+        if let Some(config) = self.state.sound_config_mut(&editor.path) {
+            editor.apply_to(config);
+            self.unsaved = true;
+        }
+        self.close_editor();
+    }
+
+    /// Closes the editor, if open, discarding unsaved changes and stopping its preview.
+    fn close_editor(&mut self) {
+        if self.state.editor.take().is_some() {
+            self.with_audio(|audio| audio.stop_preview());
         }
     }
 
     fn folder_event(&mut self, event: FolderEvent) {
         match event {
-            FolderEvent::Listing(path) => self.state.library.changed(&path),
+            FolderEvent::Listing(path) => {
+                self.state.library.changed(&path);
+                self.measure_sounds();
+            }
             FolderEvent::Contents(path) => {
                 self.state.durations.remove(&path);
+                if let Some(durations) = &mut self.durations {
+                    durations.forget(&path);
+                }
+                self.measure_sounds();
                 self.with_audio(|audio| audio.invalidate(&path));
             }
         }
@@ -268,6 +362,7 @@ impl App {
         }
         self.watch(&dir);
         self.state.library.add(dir.clone());
+        self.measure_sounds();
         self.state.config.tabs.push(TabConfig::for_folder(dir));
         self.state.select_tab(self.state.config.tabs.len() - 1);
         self.unsaved = true;
@@ -294,6 +389,17 @@ impl App {
             .collect();
         for dir in dirs {
             self.watch(&dir);
+        }
+    }
+
+    /// Starts measuring the sounds whose length isn't known yet (each sound only once).
+    fn measure_sounds(&mut self) {
+        let Some(durations) = &mut self.durations else {
+            return;
+        };
+        let sounds = self.state.library.folders().iter().flat_map(|f| &f.sounds);
+        for sound in sounds {
+            durations.request(&sound.path);
         }
     }
 
@@ -344,16 +450,32 @@ impl App {
     }
 }
 
+fn start_duration_probe() -> Option<DurationProbe> {
+    DurationProbe::start(probe_duration)
+        .inspect_err(|error| tracing::error!("could not start measuring sounds: {error}"))
+        .ok()
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
         self.apply_theme(&ctx);
-        for action in ui::draw(ui, &self.state) {
+        let actions = ui::draw(ui, &self.state);
+        if !actions.is_empty() {
+            // Show the new state right away, not with the next poll.
+            ctx.request_repaint();
+        }
+        for action in actions {
             self.apply(action);
         }
         self.save_if_idle(&ctx);
-        ctx.request_repaint_after(if self.state.playing.is_empty() {
+        let loading = self
+            .state
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.waveform == WaveformState::Loading);
+        ctx.request_repaint_after(if self.state.playing.is_empty() && !loading {
             IDLE_POLL
         } else {
             PLAYING_REPAINT

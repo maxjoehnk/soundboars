@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use soundboars::audio::{AudioEngine, EngineEvent, PlayRequest, RecordingApp};
+use soundboars::audio::{AudioEngine, Destination, EngineEvent, PlayRequest, RecordingApp};
 
 /// How long to wait for the graph to settle (and for a target to appear).
 const DISCOVERY: Duration = Duration::from_secs(2);
@@ -93,6 +93,7 @@ fn play_into(engine: &AudioEngine, target: &str, file: PathBuf) -> anyhow::Resul
         path: file,
         trim: None,
         volume: 1.0,
+        destination: Destination::Everywhere,
     });
     let result = wait_until_finished(engine);
     engine.unlink();
@@ -134,7 +135,7 @@ fn wait_until_finished(engine: &AudioEngine) -> anyhow::Result<()> {
                 bail!("could not decode {}: {error}", path.display())
             }
             EngineEvent::Error(message) => println!("Error: {message}"),
-            EngineEvent::RecordingApps(_) => {}
+            EngineEvent::RecordingApps(_) | EngineEvent::Waveform { .. } => {}
         }
     }
     bail!("the audio engine stopped")

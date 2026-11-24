@@ -7,10 +7,13 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::accesskit::Role;
+use eframe::egui::{Pos2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use soundboars::app::{App, AudioBackend, FolderPicker, Services};
-use soundboars::audio::{EngineEvent, PlayRequest, Playing, RecordingApp, Retrigger, Trim};
+use soundboars::audio::{
+    Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
+};
 use soundboars::config::{Config, ConfigStore, SavedTarget, SoundConfig, TabConfig, Theme};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
 
@@ -18,6 +21,8 @@ use soundboars::library::watch::{FolderEvent, FolderWatcher};
 enum Call {
     Play(PlayRequest),
     StopAll,
+    StopPreview,
+    LoadWaveform(PathBuf),
     SetCallVolume(f32),
     SetLocalVolume(f32),
     SetLocalEnabled(bool),
@@ -67,6 +72,12 @@ impl AudioBackend for FakeAudio {
     }
     fn stop_all(&self) {
         self.0.call(Call::StopAll);
+    }
+    fn stop_preview(&self) {
+        self.0.call(Call::StopPreview);
+    }
+    fn load_waveform(&self, path: &Path) {
+        self.0.call(Call::LoadWaveform(path.to_owned()));
     }
     fn set_call_volume(&self, volume: f32) {
         self.0.call(Call::SetCallVolume(volume));
@@ -269,6 +280,7 @@ fn clicking_a_tile_plays_it_with_its_volume_and_trim() {
                 end_ms: Some(900)
             }),
             volume: 0.5,
+            destination: Destination::Everywhere,
         })]
     );
 }
@@ -389,6 +401,7 @@ fn stop_all_stops_and_playing_sounds_are_shown() {
             path,
             started_at: Instant::now(),
             duration: Duration::from_secs(60),
+            destination: Destination::Everywhere,
         })
     });
     let mut harness = setup.start();
@@ -544,21 +557,325 @@ fn folder_changes_update_tiles_and_invalidate_sounds() {
 }
 
 #[test]
-fn tiles_show_the_length_once_a_sound_played() {
-    let setup = Setup::new();
+fn tiles_show_the_trimmed_length_without_playing() {
+    let setup = Setup::new().with_config(|config| {
+        config.tabs[0].sounds.insert(
+            "Tone.flac".to_owned(),
+            SoundConfig {
+                start_ms: 100,
+                ..SoundConfig::default()
+            },
+        );
+    });
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.flac");
+    fs::copy(fixture, setup.folder("Memes").join("Tone.flac")).expect("copy");
     let mut harness = setup.start();
 
-    let started = Playing {
-        voice: 3,
-        path: setup.folder("Memes").join("Bruh.wav"),
-        started_at: Instant::now(),
-        duration: Duration::from_millis(2500),
+    // The fixture is 0.5 s long; it's measured in the background.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.query_by_label("Tone\n0:00.40").is_none() {
+        assert!(Instant::now() < deadline, "the length never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+        harness.run();
+    }
+    assert!(
+        setup
+            .shared
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, Call::Play(_)))
+    );
+    // Files that can't be measured keep showing their format.
+    assert!(harness.query_by_label(&tile("Airhorn")).is_some());
+}
+
+// The "Edit sound" window. Airhorn is trimmed to 0.1–0.9 s at volume 0.5; its fake waveform says
+// the file is 2 s long.
+
+const AIRHORN_MS: u64 = 2_000;
+const EDITOR: &str = "Edit sound – Airhorn.wav";
+
+fn airhorn(setup: &Setup) -> PathBuf {
+    setup.folder("Memes").join("Airhorn.wav")
+}
+
+/// Opens the editor for Airhorn through the tile's context menu.
+fn open_editor(harness: &mut Harness<'_, App>) {
+    harness.get_by_label(&tile("Airhorn")).click_secondary();
+    harness.run();
+    harness.get_by_label("✏ Edit…").click();
+    harness.run();
+}
+
+/// Opens the editor for Airhorn and delivers its waveform.
+fn open_editor_with_waveform(setup: &Setup, harness: &mut Harness<'_, App>) {
+    open_editor(harness);
+    deliver_waveform(setup, harness);
+}
+
+/// The engine reports Airhorn's waveform.
+fn deliver_waveform(setup: &Setup, harness: &mut Harness<'_, App>) {
+    let waveform = Waveform {
+        peaks: vec![
+            Peak {
+                min: -0.5,
+                max: 0.5
+            };
+            200
+        ],
+        duration: Duration::from_millis(AIRHORN_MS),
     };
-    setup
-        .shared
-        .with(|world| world.engine_events.push(EngineEvent::Started(started)));
+    setup.shared.with(|world| {
+        world.engine_events.push(EngineEvent::Waveform {
+            path: airhorn(setup),
+            waveform: Ok(waveform),
+        })
+    });
+    harness.run();
+    setup.shared.clear_calls();
+}
+
+fn saved_airhorn(setup: &Setup) -> SoundConfig {
+    setup.config().tabs[0].sounds["Airhorn.wav"].clone()
+}
+
+/// The point on the waveform at `ms`.
+fn waveform_point(harness: &Harness<'_, App>, ms: u64) -> Pos2 {
+    let rect = harness.get_by_label("Waveform").rect();
+    let x = rect.left() + rect.width() * ms as f32 / AIRHORN_MS as f32;
+    Pos2::new(x, rect.center().y)
+}
+
+fn drag(harness: &mut Harness<'_, App>, from_ms: u64, to_ms: u64) {
+    let from = waveform_point(harness, from_ms);
+    let to = waveform_point(harness, to_ms);
+    harness.hover_at(from);
+    harness.run();
+    harness.drag_at(from);
+    harness.run();
+    harness.hover_at(to);
+    harness.run();
+    harness.drop_at(to);
+    harness.run();
+}
+
+fn click_editor_button(harness: &mut Harness<'_, App>, label: &str) {
+    harness.get_by_label(label).click();
+    harness.run();
+}
+
+#[test]
+fn the_editor_opens_from_the_tile_menu_and_shows_the_waveform() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    setup.shared.clear_calls();
+
+    open_editor(&mut harness);
+
+    assert!(harness.query_by_label(EDITOR).is_some());
+    assert!(harness.query_by_label("Airhorn.wav").is_some());
+    assert!(harness.query_by_label("Loading waveform…").is_some());
+    assert!(harness.query_by_label("Waveform").is_none());
+    assert_eq!(setup.shared.calls(), [Call::LoadWaveform(airhorn(&setup))]);
+
+    deliver_waveform(&setup, &mut harness);
+
+    assert!(harness.query_by_label("Loading waveform…").is_none());
+    assert!(harness.query_by_label("Waveform").is_some());
+    assert_eq!(
+        harness.get_by_label("Start").value().as_deref(),
+        Some("0.10 s")
+    );
+    assert_eq!(
+        harness.get_by_label("End").value().as_deref(),
+        Some("0.90 s")
+    );
+    assert!(harness.query_by_label("Length 0:00.80").is_some());
+}
+
+#[test]
+fn a_waveform_that_cannot_be_decoded_is_explained() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    open_editor(&mut harness);
+
+    setup.shared.with(|world| {
+        world.engine_events.push(EngineEvent::Waveform {
+            path: airhorn(&setup),
+            waveform: Err("the file contains no audio".to_owned()),
+        })
+    });
     harness.run();
 
-    assert!(harness.query_by_label("Bruh\n0:02.50").is_some());
-    assert!(harness.query_by_label(&tile("Airhorn")).is_some());
+    assert!(
+        harness
+            .query_by_label("No waveform: the file contains no audio")
+            .is_some()
+    );
+}
+
+#[test]
+fn dragging_moves_the_nearer_handle() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    drag(&mut harness, 150, 500);
+    drag(&mut harness, 1_000, 1_500);
+    click_editor_button(&mut harness, "Save");
+
+    let saved = saved_airhorn(&setup);
+    assert!(saved.start_ms.abs_diff(500) <= 10, "{saved:?}");
+    assert!(
+        saved.end_ms.is_some_and(|end| end.abs_diff(1_500) <= 10),
+        "{saved:?}"
+    );
+}
+
+#[test]
+fn trim_can_be_typed_in_and_saving_to_the_end_stores_no_end() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    harness.get_by_label("Start").set_value_accesskit(0.25);
+    harness.run();
+    harness.get_by_label("End").set_value_accesskit(2.0);
+    harness.run();
+    assert!(harness.query_by_label("Length 0:01.75").is_some());
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(
+        saved_airhorn(&setup),
+        SoundConfig {
+            volume: 0.5,
+            start_ms: 250,
+            end_ms: None,
+        }
+    );
+}
+
+#[test]
+fn reset_plays_the_whole_sound() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "↺ Reset");
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).trim(), None);
+}
+
+#[test]
+fn saved_changes_are_played() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    harness.get_by_label("Start").set_value_accesskit(0.5);
+    harness.run();
+    harness
+        .get_by_role_and_label(Role::Slider, "Volume:")
+        .set_value_accesskit(80.0);
+    harness.run();
+    click_editor_button(&mut harness, "Save");
+
+    assert!(harness.query_by_label(EDITOR).is_none());
+    assert_eq!(
+        saved_airhorn(&setup),
+        SoundConfig {
+            volume: 0.8,
+            start_ms: 500,
+            end_ms: Some(900),
+        }
+    );
+    setup.shared.clear_calls();
+    harness.get_by_label(&tile("Airhorn")).click();
+    harness.run();
+    assert_eq!(
+        setup.shared.calls(),
+        [Call::Play(PlayRequest {
+            path: airhorn(&setup),
+            trim: Some(Trim {
+                start_ms: 500,
+                end_ms: Some(900),
+            }),
+            volume: 0.8,
+            destination: Destination::Everywhere,
+        })]
+    );
+}
+
+#[test]
+fn cancel_discards_the_changes() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    let before = saved_airhorn(&setup);
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "↺ Reset");
+    click_editor_button(&mut harness, "Cancel");
+
+    assert!(harness.query_by_label(EDITOR).is_none());
+    assert_eq!(saved_airhorn(&setup), before);
+    open_editor_with_waveform(&setup, &mut harness);
+    assert_eq!(
+        harness.get_by_label("Start").value().as_deref(),
+        Some("0.10 s")
+    );
+}
+
+#[test]
+fn preview_plays_the_edited_sound_locally_and_stops_on_close() {
+    let setup = Setup::new().with_config(|config| config.settings.local_enabled = false);
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    harness.get_by_label("Start").set_value_accesskit(0.3);
+    harness.run();
+    click_editor_button(&mut harness, "▶ Preview");
+
+    assert_eq!(
+        setup.shared.calls(),
+        [Call::Play(PlayRequest {
+            path: airhorn(&setup),
+            trim: Some(Trim {
+                start_ms: 300,
+                end_ms: Some(900),
+            }),
+            volume: 0.5,
+            destination: Destination::Preview,
+        })]
+    );
+
+    // While the preview plays, the button stops it; it's not shown as playing on the board.
+    let preview = Playing {
+        voice: 7,
+        path: airhorn(&setup),
+        started_at: Instant::now(),
+        duration: Duration::from_millis(600),
+        destination: Destination::Preview,
+    };
+    setup.shared.with(|world| world.playing.push(preview));
+    harness.run();
+    assert!(harness.query_by_label("Nothing playing").is_some());
+    setup.shared.clear_calls();
+    click_editor_button(&mut harness, "⏹ Stop");
+    assert_eq!(setup.shared.calls(), [Call::StopPreview]);
+
+    setup.shared.clear_calls();
+    // Closing the dialog's window. Kittest embeds dialogs in the main window, where its close
+    // request is the one of the main viewport.
+    harness
+        .input_mut()
+        .viewports
+        .entry(ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(ViewportEvent::Close);
+    harness.run();
+    assert!(harness.query_by_label(EDITOR).is_none());
+    assert_eq!(setup.shared.calls(), [Call::StopPreview]);
+    assert_eq!(saved_airhorn(&setup).start_ms, 100);
 }
