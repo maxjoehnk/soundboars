@@ -3,9 +3,11 @@
 use eframe::egui;
 
 use super::dialog::Dialog;
-use crate::app::{Action, AppState, Setting};
+use super::hotkey_section::{RecorderEvent, bind_hint, recorder};
+use crate::app::{Action, AppState, STOP_ALL_ID, Setting};
 use crate::audio::Retrigger;
-use crate::config::{Settings, Theme};
+use crate::config::Theme;
+use crate::hotkeys::BackendKind;
 
 pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
     if !state.settings_open {
@@ -14,20 +16,23 @@ pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
     let dialog = Dialog {
         id: "settings",
         title: "Settings",
-        size: [400.0, 90.0],
+        size: [560.0, 240.0],
     };
     let closed = dialog.show(ctx, |ui| {
         egui::Grid::new("settings")
             .num_columns(2)
             .spacing([16.0, 8.0])
-            .show(ui, |ui| rows(ui, &state.config.settings, actions));
+            .show(ui, |ui| rows(ui, state, actions));
+        ui.separator();
+        hotkey_settings(ui, state, actions);
     });
     if closed {
         actions.push(Action::ShowSettings(false));
     }
 }
 
-fn rows(ui: &mut egui::Ui, settings: &Settings, actions: &mut Vec<Action>) {
+fn rows(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    let settings = &state.config.settings;
     let retrigger_options = [
         (Retrigger::Overlap, "Overlap"),
         (Retrigger::Restart, "Restart"),
@@ -40,6 +45,70 @@ fn rows(ui: &mut egui::Ui, settings: &Settings, actions: &mut Vec<Action>) {
     let theme_options = [(Theme::Dark, "Dark"), (Theme::Light, "Light")];
     if let Some(theme) = choice_row(ui, "Theme:", settings.theme, theme_options) {
         actions.push(Action::ChangeSetting(Setting::Theme(theme)));
+    }
+    let backend_options = [
+        (BackendKind::Portal, "XDG portal"),
+        (BackendKind::X11, "X11 (global-hotkey)"),
+        (BackendKind::Off, "Off"),
+    ];
+    let backend = state.hotkey_backend();
+    if let Some(kind) = choice_row(ui, "Hotkey backend:", backend, backend_options) {
+        actions.push(Action::ChangeSetting(Setting::HotkeyBackend(kind)));
+    }
+}
+
+/// A hint on the chosen backend, and the "Stop all" hotkey.
+fn hotkey_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    let capabilities = state.hotkey_capabilities;
+    if let Some(hint) = backend_hint(state.hotkey_backend(), capabilities.assign_in_app) {
+        ui.weak(hint);
+    }
+    let settings = &state.config.settings;
+    let caption = "Stop all hotkey:";
+    if let Some(hint) = capabilities
+        .bind_hint
+        .filter(|_| !capabilities.assign_in_app)
+    {
+        bind_hint(
+            ui,
+            caption,
+            hint,
+            STOP_ALL_ID,
+            settings.stop_all_hotkey,
+            false,
+        );
+        return;
+    }
+    let event = recorder(
+        ui,
+        caption,
+        settings.stop_all_hotkey,
+        state.recording_stop_all,
+    );
+    actions.extend(event.map(|event| match event {
+        RecorderEvent::Start => Action::RecordStopAllHotkey(true),
+        RecorderEvent::Cancel => Action::RecordStopAllHotkey(false),
+        RecorderEvent::Recorded(hotkey) => {
+            Action::ChangeSetting(Setting::StopAllHotkey(Some(hotkey)))
+        }
+        RecorderEvent::Clear => Action::ChangeSetting(Setting::StopAllHotkey(None)),
+    }));
+}
+
+fn backend_hint(kind: BackendKind, assign_in_app: bool) -> Option<&'static str> {
+    match kind {
+        BackendKind::X11 => Some(
+            "X11 hotkeys only work in X11 sessions. On Wayland they only fire while a window of \
+             an X11 app (XWayland) has focus.",
+        ),
+        BackendKind::Portal if !assign_in_app => Some(
+            "Your desktop ignores the keys chosen here: bind the global shortcuts in its config \
+             (see “Edit sound” of each sound).",
+        ),
+        BackendKind::Portal => {
+            Some("Your desktop may ask you to confirm or change the keys when they are registered.")
+        }
+        BackendKind::Off => None,
     }
 }
 

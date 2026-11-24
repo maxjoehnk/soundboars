@@ -1,11 +1,12 @@
-//! The "Edit sound" window's state and logic: per-sound volume and the non-destructive trim, edited
-//! on a copy that [`SoundEditor::apply_to`] writes into the sound's [`SoundConfig`] on save.
+//! The "Edit sound" window's state and logic: per-sound volume, the non-destructive trim and the
+//! global hotkey, edited on a copy that [`SoundEditor::apply_to`] writes into the sound's [`SoundConfig`] on save.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::audio::{Destination, PlayRequest, Playing, Trim, Waveform};
 use crate::config::SoundConfig;
+use crate::hotkeys::Hotkey;
 
 /// The shortest trimmed sound the handles allow.
 pub const MIN_LENGTH_MS: u64 = 50;
@@ -28,6 +29,16 @@ pub enum EditorAction {
     Save,
     /// Cancel: close without saving.
     Close,
+    /// Capture the next key combination pressed in the editor as the hotkey.
+    RecordHotkey,
+    CancelRecording,
+    /// The recorded hotkey; also gives the sound a global shortcut.
+    Hotkey(Hotkey),
+    /// Removes the hotkey and the global shortcut.
+    ClearHotkey,
+    /// Gives the sound a global shortcut without a hotkey (for desktops that bind keys
+    /// themselves, like Hyprland). The app assigns its id.
+    AddShortcut,
 }
 
 /// A trim handle on the waveform.
@@ -58,6 +69,11 @@ pub struct SoundEditor {
     pub grabbed: Option<Handle>,
     /// Where the last preview started, for the playhead.
     pub preview_start_ms: u64,
+    pub hotkey: Option<Hotkey>,
+    /// Set while the sound has a global shortcut (see [`SoundConfig::shortcut_id`]).
+    pub shortcut_id: Option<String>,
+    /// The next key combination pressed becomes the hotkey.
+    pub recording: bool,
 }
 
 impl SoundEditor {
@@ -76,6 +92,9 @@ impl SoundEditor {
             waveform: WaveformState::Loading,
             grabbed: None,
             preview_start_ms: 0,
+            hotkey: saved.hotkey,
+            shortcut_id: saved.shortcut_id.clone(),
+            recording: false,
         }
     }
 
@@ -107,9 +126,10 @@ impl SoundEditor {
         Some(Duration::from_millis(end.saturating_sub(self.start_ms)))
     }
 
-    /// Changes the editor's copy; actions that need services ([`EditorAction::Preview`],
-    /// [`EditorAction::StopPreview`], [`EditorAction::Save`], [`EditorAction::Close`]) are the
-    /// app's business and ignored here.
+    /// Changes the editor's copy; actions that need services or the config
+    /// ([`EditorAction::Preview`], [`EditorAction::StopPreview`], [`EditorAction::Save`],
+    /// [`EditorAction::Close`], assigning the id for [`EditorAction::AddShortcut`]) are the app's
+    /// business and ignored here.
     pub fn apply(&mut self, action: EditorAction) {
         match action {
             EditorAction::Volume(volume) => self.volume = volume.max(0.0),
@@ -130,10 +150,22 @@ impl SoundEditor {
                 self.start_ms = 0;
                 self.end_ms = self.duration_ms();
             }
+            EditorAction::RecordHotkey => self.recording = true,
+            EditorAction::CancelRecording => self.recording = false,
+            EditorAction::Hotkey(hotkey) => {
+                self.hotkey = Some(hotkey);
+                self.recording = false;
+            }
+            EditorAction::ClearHotkey => {
+                self.hotkey = None;
+                self.shortcut_id = None;
+                self.recording = false;
+            }
             EditorAction::Preview
             | EditorAction::StopPreview
             | EditorAction::Save
-            | EditorAction::Close => {}
+            | EditorAction::Close
+            | EditorAction::AddShortcut => {}
         }
     }
 
@@ -154,13 +186,15 @@ impl SoundEditor {
         self.preview_start_ms + duration_ms(elapsed.min(preview.duration))
     }
 
-    /// Writes the volume and trim into `config`: a trim to the end of the sound is stored as no
-    /// end, so the whole sound is played without any trim at all.
+    /// Writes the volume, trim and hotkey into `config`: a trim to the end of the sound is stored
+    /// as no end, so the whole sound is played without any trim at all.
     pub fn apply_to(&self, config: &mut SoundConfig) {
         let trim = self.trim().unwrap_or_default();
         config.volume = self.volume;
         config.start_ms = trim.start_ms;
         config.end_ms = trim.end_ms;
+        config.hotkey = self.hotkey;
+        config.shortcut_id = self.shortcut_id.clone();
     }
 
     /// The edited trim, `None` for the whole sound.
@@ -249,6 +283,7 @@ mod tests {
             volume: 0.5,
             start_ms,
             end_ms,
+            ..SoundConfig::default()
         };
         let mut editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
         editor.waveform_loaded(Ok(waveform()));
@@ -271,6 +306,7 @@ mod tests {
             volume: 0.5,
             start_ms: 100,
             end_ms: None,
+            ..SoundConfig::default()
         };
         let editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
         assert_eq!(editor.name, "Air horn.mp3");
@@ -363,6 +399,7 @@ mod tests {
                 volume: 0.8,
                 start_ms: 0,
                 end_ms: None,
+                ..SoundConfig::default()
             }
         );
         editor.apply(EditorAction::Start(300));
@@ -431,5 +468,43 @@ mod tests {
         assert_eq!(x_of(500, 10.0, 200.0, SOUND_MS), 60.0);
         assert_eq!(x_of(99_999, 10.0, 200.0, SOUND_MS), 210.0);
         assert_eq!(x_of(100, 10.0, 200.0, 0), 10.0);
+    }
+
+    #[test]
+    fn hotkeys_are_recorded_cleared_and_saved() {
+        let ctrl_f13: Hotkey = "Ctrl+F13".parse().expect("valid hotkey");
+        let saved = SoundConfig {
+            hotkey: Some(ctrl_f13),
+            shortcut_id: Some("play-air-horn".to_owned()),
+            ..SoundConfig::default()
+        };
+        let mut editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
+        assert_eq!(editor.hotkey, Some(ctrl_f13));
+        assert_eq!(editor.shortcut_id.as_deref(), Some("play-air-horn"));
+
+        editor.apply(EditorAction::RecordHotkey);
+        assert!(editor.recording);
+        editor.apply(EditorAction::CancelRecording);
+        assert!(!editor.recording);
+        assert_eq!(editor.hotkey, Some(ctrl_f13));
+
+        editor.apply(EditorAction::ClearHotkey);
+        assert_eq!((editor.hotkey, editor.shortcut_id.as_deref()), (None, None));
+        assert_eq!(saved_hotkey(&editor), (None, None));
+
+        let alt_1: Hotkey = "Alt+1".parse().expect("valid hotkey");
+        editor.apply(EditorAction::RecordHotkey);
+        editor.apply(EditorAction::Hotkey(alt_1));
+        assert!(!editor.recording);
+        editor.shortcut_id = Some("play-air-horn".to_owned());
+        assert_eq!(
+            saved_hotkey(&editor),
+            (Some(alt_1), Some("play-air-horn".to_owned()))
+        );
+    }
+
+    fn saved_hotkey(editor: &SoundEditor) -> (Option<Hotkey>, Option<String>) {
+        let saved = saved(editor);
+        (saved.hotkey, saved.shortcut_id)
     }
 }

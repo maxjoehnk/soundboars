@@ -3,6 +3,7 @@
 mod board;
 mod bottom_bar;
 mod dialog;
+mod hotkey_section;
 mod settings;
 mod sound_editor;
 mod top_bar;

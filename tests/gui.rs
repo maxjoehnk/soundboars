@@ -7,14 +7,17 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::accesskit::Role;
-use eframe::egui::{Pos2, ViewportEvent, ViewportId};
+use eframe::egui::{Key, Modifiers, Pos2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use soundboars::app::{App, AudioBackend, FolderPicker, Services};
+use soundboars::app::{App, AudioBackend, FolderPicker, HotkeyBackends, Services};
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
 use soundboars::config::{Config, ConfigStore, SavedTarget, SoundConfig, TabConfig, Theme};
+use soundboars::hotkeys::{
+    BackendKind, BindHint, Binding, Capabilities, EventSink, Hotkey, HotkeyBackend, HotkeyEvent,
+};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +44,15 @@ struct World {
     watched: Vec<PathBuf>,
     folder_events: Vec<FolderEvent>,
     folder_to_pick: Option<PathBuf>,
+    /// The hotkey backends started, in order.
+    hotkey_backends: Vec<BackendKind>,
+    /// Every set of bindings registered with the running backend.
+    registered: Vec<Vec<Binding>>,
+    /// Where the running hotkey backend sends its events.
+    hotkey_events: Option<EventSink>,
+    hotkey_capabilities: Capabilities,
+    /// Starting a hotkey backend fails with this.
+    hotkey_error: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -136,6 +148,40 @@ impl FolderPicker for FakePicker {
     }
 }
 
+struct FakeHotkeys(Shared);
+
+impl HotkeyBackends for FakeHotkeys {
+    fn start(
+        &self,
+        kind: BackendKind,
+        events: EventSink,
+    ) -> Result<Option<Box<dyn HotkeyBackend>>, String> {
+        self.0.with(|world| {
+            world.hotkey_backends.push(kind);
+            world.hotkey_events = Some(events);
+            match world.hotkey_error.clone() {
+                Some(error) => Err(error),
+                None if kind == BackendKind::Off => Ok(None),
+                None => Ok(Some(
+                    Box::new(FakeHotkeyBackend(self.0.clone())) as Box<dyn HotkeyBackend>
+                )),
+            }
+        })
+    }
+}
+
+struct FakeHotkeyBackend(Shared);
+
+impl HotkeyBackend for FakeHotkeyBackend {
+    fn register(&mut self, bindings: &[Binding]) {
+        self.0
+            .with(|world| world.registered.push(bindings.to_vec()));
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.0.with(|world| world.hotkey_capabilities)
+    }
+}
+
 /// Two tabs: `Memes` (Airhorn, Bruh) and `SFX` (Applause, Horn). Airhorn has a volume and a trim.
 struct Setup {
     dir: tempfile::TempDir,
@@ -164,13 +210,16 @@ impl Setup {
                 volume: 0.5,
                 start_ms: 100,
                 end_ms: Some(900),
+                ..SoundConfig::default()
             },
         );
         let store = ConfigStore::new(dir.path().join("config/config.toml"));
-        let config = Config {
+        let mut config = Config {
             tabs: vec![memes_tab, TabConfig::for_folder(sfx)],
             ..Config::default()
         };
+        // Not the session's default, which depends on where the tests run.
+        config.settings.hotkey_backend = Some(BackendKind::X11);
         store.save(&config).expect("save config");
         Self {
             dir,
@@ -209,6 +258,7 @@ impl Setup {
             watcher: Box::new(FakeWatcher(self.shared.clone())),
             folder_picker: Box::new(FakePicker(self.shared.clone())),
             config: self.store.clone(),
+            hotkeys: Box::new(FakeHotkeys(self.shared.clone())),
         };
         let mut harness = Harness::builder()
             .with_size([1000.0, 700.0])
@@ -601,7 +651,8 @@ fn airhorn(setup: &Setup) -> PathBuf {
 
 /// Opens the editor for Airhorn through the tile's context menu.
 fn open_editor(harness: &mut Harness<'_, App>) {
-    harness.get_by_label(&tile("Airhorn")).click_secondary();
+    // The tile, whatever its subtitle.
+    harness.get_by_label_contains("Airhorn\n").click_secondary();
     harness.run();
     harness.get_by_label("✏ Edit…").click();
     harness.run();
@@ -751,6 +802,7 @@ fn trim_can_be_typed_in_and_saving_to_the_end_stores_no_end() {
             volume: 0.5,
             start_ms: 250,
             end_ms: None,
+            ..SoundConfig::default()
         }
     );
 }
@@ -788,6 +840,7 @@ fn saved_changes_are_played() {
             volume: 0.8,
             start_ms: 500,
             end_ms: Some(900),
+            ..SoundConfig::default()
         }
     );
     setup.shared.clear_calls();
@@ -878,4 +931,336 @@ fn preview_plays_the_edited_sound_locally_and_stops_on_close() {
     assert!(harness.query_by_label(EDITOR).is_none());
     assert_eq!(setup.shared.calls(), [Call::StopPreview]);
     assert_eq!(saved_airhorn(&setup).start_ms, 100);
+}
+// Global hotkeys, with a fake backend. The settings choose the X11 backend (see `Setup::new`).
+
+fn hotkey(text: &str) -> Hotkey {
+    text.parse().expect("valid hotkey")
+}
+
+fn binding(id: &str, description: &str, hotkey: Option<Hotkey>) -> Binding {
+    Binding {
+        id: id.to_owned(),
+        description: description.to_owned(),
+        hotkey,
+    }
+}
+
+/// The bindings registered last.
+fn registered(setup: &Setup) -> Vec<Binding> {
+    setup
+        .shared
+        .with(|world| world.registered.last().cloned().unwrap_or_default())
+}
+
+/// The backend reports a hotkey event.
+fn hotkey_event(setup: &Setup, harness: &mut Harness<'_, App>, event: HotkeyEvent) {
+    let events = setup
+        .shared
+        .with(|world| world.hotkey_events.clone())
+        .expect("a hotkey backend runs");
+    events.send(event);
+    harness.run();
+}
+
+/// Airhorn has the hotkey Ctrl+F13 and the shortcut id `play-airhorn`.
+fn setup_with_airhorn_hotkey() -> Setup {
+    Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0]
+            .sounds
+            .get_mut("Airhorn.wav")
+            .expect("airhorn");
+        airhorn.hotkey = Some(hotkey("Ctrl+F13"));
+        airhorn.shortcut_id = Some("play-airhorn".to_owned());
+    })
+}
+
+fn hyprland() -> Capabilities {
+    Capabilities {
+        assign_in_app: false,
+        bind_hint: Some(BindHint::Hyprland),
+    }
+}
+
+#[test]
+fn startup_registers_the_hotkeys_of_the_config() {
+    let setup = setup_with_airhorn_hotkey();
+    let harness = setup.start();
+
+    assert_eq!(
+        setup.shared.with(|world| world.hotkey_backends.clone()),
+        [BackendKind::X11]
+    );
+    assert_eq!(
+        registered(&setup),
+        [
+            binding("stop-all", "Stop all sounds", None),
+            binding("play-airhorn", "Play Airhorn", Some(hotkey("Ctrl+F13"))),
+        ]
+    );
+    assert!(harness.query_by_label("Airhorn\nWAV · Ctrl+F13").is_some());
+}
+
+#[test]
+fn a_hotkey_recorded_in_the_editor_is_saved_and_registered() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Record");
+    assert!(
+        harness
+            .query_by_label("Press the keys… (Esc cancels)")
+            .is_some()
+    );
+    // Modifier keys alone don't count.
+    harness.key_press_modifiers(Modifiers::CTRL, Key::ShiftLeft);
+    harness.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::F13);
+    harness.run();
+    assert!(harness.query_by_label("Ctrl+Shift+F13").is_some());
+    assert!(
+        registered(&setup).len() == 1,
+        "registered only once saved: {:?}",
+        registered(&setup)
+    );
+    click_editor_button(&mut harness, "Save");
+
+    let saved = saved_airhorn(&setup);
+    assert_eq!(saved.hotkey, Some(hotkey("Ctrl+Shift+F13")));
+    assert_eq!(saved.shortcut_id.as_deref(), Some("play-airhorn"));
+    assert_eq!(
+        registered(&setup),
+        [
+            binding("stop-all", "Stop all sounds", None),
+            binding(
+                "play-airhorn",
+                "Play Airhorn",
+                Some(hotkey("Ctrl+Shift+F13"))
+            ),
+        ]
+    );
+    assert!(
+        harness
+            .query_by_label("Airhorn\nWAV · Ctrl+Shift+F13")
+            .is_some()
+    );
+}
+
+#[test]
+fn escape_cancels_recording() {
+    let setup = setup_with_airhorn_hotkey();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Record");
+    harness.key_press(Key::Escape);
+    harness.run();
+
+    assert!(
+        harness
+            .query_by_label("Press the keys… (Esc cancels)")
+            .is_none()
+    );
+    assert!(harness.query_by_label("Ctrl+F13").is_some());
+}
+
+#[test]
+fn clearing_the_hotkey_removes_the_global_shortcut() {
+    let setup = setup_with_airhorn_hotkey();
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Clear");
+    click_editor_button(&mut harness, "Save");
+
+    let saved = saved_airhorn(&setup);
+    assert_eq!((saved.hotkey, saved.shortcut_id), (None, None));
+    assert_eq!(
+        registered(&setup),
+        [binding("stop-all", "Stop all sounds", None)]
+    );
+    assert!(harness.query_by_label(&tile("Airhorn")).is_some());
+}
+
+#[test]
+fn hyprland_shows_the_shortcut_id_and_bind_line_instead_of_a_recorder() {
+    let setup = Setup::new()
+        .with_config(|config| config.settings.hotkey_backend = Some(BackendKind::Portal));
+    setup
+        .shared
+        .with(|world| world.hotkey_capabilities = hyprland());
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label("Record").is_none());
+
+    click_editor_button(&mut harness, "Add global shortcut");
+
+    assert!(harness.query_by_label("play-airhorn").is_some());
+    let bind_line =
+        r#"hl.bind("CTRL + F13", hl.dsp.global("me.maxjoehnk.soundboars:play-airhorn"))"#;
+    assert!(harness.query_by_label(bind_line).is_some());
+    click_editor_button(&mut harness, "Copy");
+    click_editor_button(&mut harness, "Save");
+
+    let saved = saved_airhorn(&setup);
+    assert_eq!(saved.shortcut_id.as_deref(), Some("play-airhorn"));
+    assert_eq!(saved.hotkey, None);
+    assert_eq!(
+        registered(&setup)[1],
+        binding("play-airhorn", "Play Airhorn", None)
+    );
+
+    // Removing and adding it again keeps the id users bound in their config.
+    open_editor_with_waveform(&setup, &mut harness);
+    click_editor_button(&mut harness, "Remove");
+    click_editor_button(&mut harness, "Add global shortcut");
+    assert!(harness.query_by_label("play-airhorn").is_some());
+}
+
+#[test]
+fn hotkey_presses_play_sounds_and_stop_all() {
+    let setup = setup_with_airhorn_hotkey();
+    let mut harness = setup.start();
+    setup.shared.clear_calls();
+
+    hotkey_event(
+        &setup,
+        &mut harness,
+        HotkeyEvent::Pressed("play-airhorn".into()),
+    );
+    hotkey_event(
+        &setup,
+        &mut harness,
+        HotkeyEvent::Released("play-airhorn".into()),
+    );
+    hotkey_event(&setup, &mut harness, HotkeyEvent::Pressed("unknown".into()));
+    hotkey_event(
+        &setup,
+        &mut harness,
+        HotkeyEvent::Pressed("stop-all".into()),
+    );
+
+    assert_eq!(
+        setup.shared.calls(),
+        [
+            Call::Play(PlayRequest {
+                path: airhorn(&setup),
+                trim: Some(Trim {
+                    start_ms: 100,
+                    end_ms: Some(900),
+                }),
+                volume: 0.5,
+                destination: Destination::Everywhere,
+            }),
+            Call::StopAll,
+        ]
+    );
+}
+
+#[test]
+fn hotkey_errors_are_shown() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+
+    hotkey_event(
+        &setup,
+        &mut harness,
+        HotkeyEvent::Error("Global shortcuts are not available".into()),
+    );
+
+    assert!(
+        harness
+            .query_by_label("Global shortcuts are not available")
+            .is_some()
+    );
+}
+
+#[test]
+fn a_backend_that_cannot_start_is_explained() {
+    let setup = Setup::new();
+    setup
+        .shared
+        .with(|world| world.hotkey_error = Some("no X11 display".into()));
+    let harness = setup.start();
+
+    assert!(
+        harness
+            .query_by_label("Hotkeys are not available: no X11 display")
+            .is_some()
+    );
+    assert!(harness.query_by_label(&tile("Airhorn")).is_some());
+}
+
+#[test]
+fn the_stop_all_hotkey_is_recorded_in_the_settings() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+
+    harness.get_by_label("Record").click();
+    harness.run();
+    harness.key_press_modifiers(Modifiers::CTRL, Key::Pause);
+    harness.run();
+
+    assert_eq!(
+        setup.config().settings.stop_all_hotkey,
+        Some(hotkey("Ctrl+Pause"))
+    );
+    assert_eq!(
+        registered(&setup),
+        [binding(
+            "stop-all",
+            "Stop all sounds",
+            Some(hotkey("Ctrl+Pause"))
+        )]
+    );
+    assert!(harness.query_by_label("Ctrl+Pause").is_some());
+
+    harness.get_by_label("Clear").click();
+    harness.run();
+    assert_eq!(setup.config().settings.stop_all_hotkey, None);
+}
+
+#[test]
+fn switching_the_hotkey_backend_starts_it_and_registers_again() {
+    let setup = setup_with_airhorn_hotkey();
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    assert!(
+        harness
+            .query_by_label_contains("X11 hotkeys only work in X11 sessions")
+            .is_some()
+    );
+
+    harness.get_by_label("Off").click();
+    harness.run();
+    assert_eq!(
+        setup.config().settings.hotkey_backend,
+        Some(BackendKind::Off)
+    );
+
+    setup
+        .shared
+        .with(|world| world.hotkey_capabilities = hyprland());
+    harness.get_by_label("XDG portal").click();
+    harness.run();
+
+    assert_eq!(
+        setup.shared.with(|world| world.hotkey_backends.clone()),
+        [BackendKind::X11, BackendKind::Off, BackendKind::Portal]
+    );
+    let registrations = setup.shared.with(|world| world.registered.clone());
+    assert_eq!(registrations.len(), 2, "{registrations:?}");
+    assert_eq!(registrations[0], registrations[1]);
+    // Hyprland: the stop-all shortcut is bound in its config, not recorded.
+    assert!(harness.query_by_label("Record").is_none());
+    assert!(
+        harness
+            .query_by_label(
+                r#"hl.bind("CTRL + F13", hl.dsp.global("me.maxjoehnk.soundboars:stop-all"))"#
+            )
+            .is_some()
+    );
 }

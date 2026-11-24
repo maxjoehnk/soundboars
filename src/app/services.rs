@@ -1,11 +1,12 @@
 //! The outside world as the app sees it: small traits so GUI tests can run with fakes instead of
-//! PipeWire and the desktop portal.
+//! PipeWire, the desktop portal and global hotkeys.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
 use crate::audio::{AudioEngine, EngineEvent, PlayRequest, Playing, Retrigger};
+use crate::hotkeys::{self, BackendKind, EventSink, HotkeyBackend};
 
 /// What the UI needs from [`AudioEngine`]. Every call returns right away.
 pub trait AudioBackend {
@@ -106,5 +107,29 @@ impl FolderPicker for PortalFolderPicker {
         if let Err(error) = spawned {
             tracing::error!("could not open the folder picker: {error}");
         }
+    }
+}
+
+/// Starts hotkey backends; switching the backend in the settings starts a new one.
+pub trait HotkeyBackends {
+    /// The backend of `kind` (`None` for [`BackendKind::Off`]), sending its events to `events`.
+    fn start(
+        &self,
+        kind: BackendKind,
+        events: EventSink,
+    ) -> Result<Option<Box<dyn HotkeyBackend>>, String>;
+}
+
+/// The real backends: the XDG portal and X11.
+#[derive(Debug, Default)]
+pub struct SystemHotkeys;
+
+impl HotkeyBackends for SystemHotkeys {
+    fn start(
+        &self,
+        kind: BackendKind,
+        events: EventSink,
+    ) -> Result<Option<Box<dyn HotkeyBackend>>, String> {
+        hotkeys::start(kind, events)
     }
 }

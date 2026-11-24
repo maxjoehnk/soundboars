@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{RecordingApp, Retrigger, Trim};
+use crate::hotkeys::{self, BackendKind, Hotkey};
 
 /// Overrides where the config file lives (e.g. for tests).
 pub const CONFIG_PATH_ENV: &str = "SOUNDBOARS_CONFIG";
@@ -33,6 +34,10 @@ pub struct Settings {
     pub local_enabled: bool,
     pub retrigger: Retrigger,
     pub theme: Theme,
+    /// `None` picks the default for the session ([`BackendKind::default_for_session`]).
+    pub hotkey_backend: Option<BackendKind>,
+    #[serde(deserialize_with = "hotkeys::hotkey::deserialize_lenient")]
+    pub stop_all_hotkey: Option<Hotkey>,
 }
 
 impl Default for Settings {
@@ -43,6 +48,8 @@ impl Default for Settings {
             local_enabled: true,
             retrigger: Retrigger::default(),
             theme: Theme::default(),
+            hotkey_backend: None,
+            stop_all_hotkey: None,
         }
     }
 }
@@ -124,6 +131,16 @@ pub struct SoundConfig {
     #[serde(skip_serializing_if = "is_zero")]
     pub start_ms: u64,
     pub end_ms: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "hotkeys::hotkey::deserialize_lenient"
+    )]
+    pub hotkey: Option<Hotkey>,
+    /// The global shortcut's id (a slug of the file name, unique in the config); set while the
+    /// sound has a global shortcut. Users bind it in their compositor's config, so it never
+    /// changes once assigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortcut_id: Option<String>,
 }
 
 impl Default for SoundConfig {
@@ -132,6 +149,8 @@ impl Default for SoundConfig {
             volume: 1.0,
             start_ms: 0,
             end_ms: None,
+            hotkey: None,
+            shortcut_id: None,
         }
     }
 }
@@ -301,6 +320,8 @@ mod tests {
                 volume: 0.5,
                 start_ms: 250,
                 end_ms: Some(1500),
+                hotkey: "Ctrl+Shift+F13".parse().ok(),
+                shortcut_id: Some("play-airhorn".to_owned()),
             },
         );
         Config {
@@ -310,6 +331,8 @@ mod tests {
                 local_enabled: false,
                 retrigger: Retrigger::Restart,
                 theme: Theme::Light,
+                hotkey_backend: Some(BackendKind::X11),
+                stop_all_hotkey: "Ctrl+Pause".parse().ok(),
             },
             target: Some(SavedTarget {
                 process_binary: Some("Discord".to_owned()),
@@ -348,6 +371,9 @@ mod tests {
         assert!(text.contains("theme = \"light\""), "{text}");
         assert!(text.contains("[tabs.sounds.\"airhorn.mp3\"]"), "{text}");
         assert!(text.contains("call_volume = 0.8"), "{text}");
+        assert!(text.contains("hotkey_backend = \"x11\""), "{text}");
+        assert!(text.contains("hotkey = \"Ctrl+Shift+F13\""), "{text}");
+        assert!(text.contains("shortcut_id = \"play-airhorn\""), "{text}");
     }
 
     #[test]
@@ -382,7 +408,7 @@ mod tests {
             [[tabs]]
             path = "/sounds"
             [tabs.sounds."a.wav"]
-            hotkey = "Ctrl+F13"
+            future_field = "Ctrl+F13"
         "#;
         fs::write(store.path(), text).expect("write");
 

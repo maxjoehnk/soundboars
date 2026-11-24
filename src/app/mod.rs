@@ -2,6 +2,7 @@
 //! services, let [`ui`] draw the state and collect [`Action`]s, then apply them. Drawing never
 //! changes state or talks to services itself.
 
+mod hotkeys;
 mod services;
 mod sound_editor;
 mod state;
@@ -9,7 +10,7 @@ mod targets;
 mod ui;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
 use eframe::egui;
@@ -17,10 +18,12 @@ use eframe::egui;
 use crate::audio::decode::probe_duration;
 use crate::audio::{EngineEvent, Retrigger, Waveform};
 use crate::config::{ConfigStore, SavedTarget, Settings, TabConfig, Theme};
+use crate::hotkeys::{BackendKind, Hotkey};
 use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
 
-pub use services::{AudioBackend, FolderPicker, PortalFolderPicker};
+pub use hotkeys::STOP_ALL_ID;
+pub use services::{AudioBackend, FolderPicker, HotkeyBackends, PortalFolderPicker, SystemHotkeys};
 pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
 pub use targets::{NO_APPS_HINT, Targets};
@@ -55,6 +58,8 @@ pub enum Action {
     /// Opens the "Edit sound" window for the sound at this path.
     EditSound(PathBuf),
     Editor(EditorAction),
+    /// Starts (`true`) or cancels recording the "Stop all" hotkey in the settings.
+    RecordStopAllHotkey(bool),
 }
 
 /// A change to [`Settings`].
@@ -65,6 +70,8 @@ pub enum Setting {
     LocalEnabled(bool),
     Retrigger(Retrigger),
     Theme(Theme),
+    HotkeyBackend(BackendKind),
+    StopAllHotkey(Option<Hotkey>),
 }
 
 impl Setting {
@@ -75,6 +82,8 @@ impl Setting {
             Self::LocalEnabled(enabled) => settings.local_enabled = enabled,
             Self::Retrigger(retrigger) => settings.retrigger = retrigger,
             Self::Theme(theme) => settings.theme = theme,
+            Self::HotkeyBackend(kind) => settings.hotkey_backend = Some(kind),
+            Self::StopAllHotkey(hotkey) => settings.stop_all_hotkey = hotkey,
         }
     }
 
@@ -85,7 +94,7 @@ impl Setting {
             Self::LocalVolume(volume) => audio.set_local_volume(volume),
             Self::LocalEnabled(enabled) => audio.set_local_enabled(enabled),
             Self::Retrigger(retrigger) => audio.set_retrigger_policy(retrigger),
-            Self::Theme(_) => {}
+            Self::Theme(_) | Self::HotkeyBackend(_) | Self::StopAllHotkey(_) => {}
         }
     }
 }
@@ -97,6 +106,7 @@ pub struct Services {
     pub watcher: Box<dyn FolderWatcher>,
     pub folder_picker: Box<dyn FolderPicker>,
     pub config: ConfigStore,
+    pub hotkeys: Box<dyn HotkeyBackends>,
 }
 
 pub struct App {
@@ -111,6 +121,9 @@ pub struct App {
     /// The config changed and hasn't been saved yet.
     unsaved: bool,
     applied_theme: Option<Theme>,
+    hotkeys: hotkeys::Hotkeys,
+    /// For hotkey backends to wake the UI; set on the first frame.
+    repaint: Arc<OnceLock<egui::Context>>,
 }
 
 impl App {
@@ -132,6 +145,13 @@ impl App {
                 None
             }
         };
+        let repaint = Arc::new(OnceLock::<egui::Context>::new());
+        let wake = repaint.clone();
+        let hotkeys = hotkeys::Hotkeys::new(services.hotkeys, move || {
+            if let Some(ctx) = wake.get() {
+                ctx.request_repaint();
+            }
+        });
         let mut app = Self {
             state,
             audio,
@@ -142,10 +162,13 @@ impl App {
             durations: start_duration_probe(),
             unsaved: false,
             applied_theme: None,
+            hotkeys,
+            repaint,
         };
         app.watch_tabs();
         app.measure_sounds();
         app.apply_settings();
+        app.sync_hotkeys();
         for error in &app.state.errors {
             tracing::warn!("{error}");
         }
@@ -170,6 +193,9 @@ impl App {
         }
         while let Ok(folder) = self.picked_folders.1.try_recv() {
             self.add_tab(folder);
+        }
+        for outcome in self.hotkeys.poll() {
+            self.hotkey_outcome(outcome);
         }
         let measured = self.durations.as_ref().map(DurationProbe::poll);
         for (path, duration) in measured.into_iter().flatten() {
@@ -203,6 +229,27 @@ impl App {
             }
             Action::EditSound(path) => self.edit_sound(&path),
             Action::Editor(action) => self.editor_action(action),
+            Action::RecordStopAllHotkey(recording) => self.state.recording_stop_all = recording,
+        }
+        self.sync_hotkeys();
+    }
+
+    /// Starts the chosen hotkey backend and registers the config's bindings, if either changed.
+    fn sync_hotkeys(&mut self) {
+        let kind = self.state.hotkey_backend();
+        if let Some(error) = self.hotkeys.sync(kind, &self.state.config) {
+            self.show_error(error);
+        }
+        self.state.hotkey_capabilities = self.hotkeys.capabilities();
+    }
+
+    fn hotkey_outcome(&mut self, outcome: hotkeys::Outcome) {
+        match outcome {
+            hotkeys::Outcome::Triggered(hotkeys::Target::Play(path)) => {
+                self.apply(Action::Play(path));
+            }
+            hotkeys::Outcome::Triggered(hotkeys::Target::StopAll) => self.apply(Action::StopAll),
+            hotkeys::Outcome::Error(error) => self.show_error(error),
         }
     }
 
@@ -267,7 +314,32 @@ impl App {
             EditorAction::StopPreview => self.with_audio(|audio| audio.stop_preview()),
             EditorAction::Save => self.save_editor(),
             EditorAction::Close => self.close_editor(),
+            EditorAction::Hotkey(_) | EditorAction::AddShortcut => {
+                editor.apply(action);
+                self.assign_shortcut_id();
+            }
             _ => editor.apply(action),
+        }
+    }
+
+    /// Gives the edited sound a global shortcut id if it has none: the one it had when the editor
+    /// opened (so removing and adding it again keeps it), else a new one.
+    fn assign_shortcut_id(&mut self) {
+        let Some(editor) = &self.state.editor else {
+            return;
+        };
+        if editor.shortcut_id.is_some() {
+            return;
+        }
+        let saved = self.state.sound_config(&editor.path);
+        let id = saved
+            .and_then(|saved| saved.shortcut_id)
+            .unwrap_or_else(|| {
+                let file_name = editor.path.file_name().unwrap_or_default();
+                hotkeys::unique_shortcut_id(&self.state.config, &file_name.to_string_lossy())
+            });
+        if let Some(editor) = &mut self.state.editor {
+            editor.shortcut_id = Some(id);
         }
     }
 
@@ -411,6 +483,9 @@ impl App {
     }
 
     fn change_setting(&mut self, setting: Setting) {
+        if let Setting::StopAllHotkey(_) = setting {
+            self.state.recording_stop_all = false;
+        }
         setting.write_to(&mut self.state.config.settings);
         self.with_audio(|audio| setting.apply_to(audio));
         self.unsaved = true;
@@ -459,6 +534,7 @@ fn start_duration_probe() -> Option<DurationProbe> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.repaint.get_or_init(|| ctx.clone());
         self.poll();
         self.apply_theme(&ctx);
         let actions = ui::draw(ui, &self.state);

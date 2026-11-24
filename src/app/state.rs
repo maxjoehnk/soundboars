@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{Destination, PlayRequest, Playing};
 use crate::config::{Config, SoundConfig};
+use crate::hotkeys::{BackendKind, Capabilities};
 use crate::library::{Library, Sound};
 
 use super::sound_editor::SoundEditor;
@@ -30,6 +31,12 @@ pub struct AppState {
     pub settings_open: bool,
     /// The "Edit sound" window, while open.
     pub editor: Option<SoundEditor>,
+    /// What the running hotkey backend can do.
+    pub hotkey_capabilities: Capabilities,
+    /// The hotkey backend used while the settings don't choose one.
+    pub default_hotkey_backend: BackendKind,
+    /// The settings' "Stop all" hotkey recorder waits for a key combination.
+    pub recording_stop_all: bool,
 }
 
 impl AppState {
@@ -47,6 +54,9 @@ impl AppState {
             audio_available: true,
             settings_open: false,
             editor: None,
+            hotkey_capabilities: Capabilities::default(),
+            default_hotkey_backend: BackendKind::default_for_session(),
+            recording_stop_all: false,
         }
     }
 
@@ -131,13 +141,24 @@ impl AppState {
             .collect()
     }
 
-    /// The second line of a tile: the trimmed length once known, else the file format.
+    /// The second line of a tile: the trimmed length once known, else the file format; then the
+    /// hotkey, if the sound has one.
     pub fn subtitle(&self, sound: &Sound) -> String {
         let length = self.durations.get(&sound.path);
-        match (length, self.sound_config(&sound.path)) {
+        let meta = self.sound_config(&sound.path);
+        let first = match (length, &meta) {
             (Some(&length), Some(meta)) => format_duration(meta.trimmed_length(length)),
             _ => sound.format(),
+        };
+        match meta.and_then(|meta| meta.hotkey) {
+            Some(hotkey) => format!("{first} · {hotkey}"),
+            None => first,
         }
+    }
+
+    /// The hotkey backend to use: the one chosen in the settings, else the session's default.
+    pub fn hotkey_backend(&self) -> BackendKind {
+        (self.config.settings.hotkey_backend).unwrap_or(self.default_hotkey_backend)
     }
 
     /// Selects a tab, keeping the selection in range after tabs were removed.
@@ -195,6 +216,8 @@ mod tests {
                 volume: 0.5,
                 start_ms: 100,
                 end_ms: Some(900),
+                hotkey: "Ctrl+Shift+F13".parse().ok(),
+                ..SoundConfig::default()
             },
         );
         let config = Config {
@@ -311,7 +334,7 @@ mod tests {
     fn subtitles_show_the_length_once_known() {
         let mut f = fixture();
         let [airhorn, bruh] = [0, 1].map(|index| f.state.visible_sounds()[index].clone());
-        assert_eq!(f.state.subtitle(&airhorn), "MP3");
+        assert_eq!(f.state.subtitle(&airhorn), "MP3 · Ctrl+Shift+F13");
         for sound in [&airhorn, &bruh] {
             f.state
                 .durations
@@ -320,8 +343,17 @@ mod tests {
         assert_eq!(f.state.subtitle(&bruh), "1:02.50");
         assert_eq!(
             f.state.subtitle(&airhorn),
-            "0:00.80",
+            "0:00.80 · Ctrl+Shift+F13",
             "trimmed to 0.1–0.9 s"
         );
+    }
+
+    #[test]
+    fn the_settings_choose_the_hotkey_backend_or_the_default() {
+        let mut f = fixture();
+        f.state.default_hotkey_backend = BackendKind::Portal;
+        assert_eq!(f.state.hotkey_backend(), BackendKind::Portal);
+        f.state.config.settings.hotkey_backend = Some(BackendKind::Off);
+        assert_eq!(f.state.hotkey_backend(), BackendKind::Off);
     }
 }

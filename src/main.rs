@@ -1,8 +1,11 @@
-//! The `soundboars` binary: wires the config, the audio engine, the folder watcher and the UI.
+//! The `soundboars` binary: wires the config, the audio engine, the folder watcher, the hotkey
+//! backends and the UI.
 
 use anyhow::Context as _;
 use eframe::egui;
-use soundboars::app::{APP_ID, App, AudioBackend, ICON_PNG, PortalFolderPicker, Services};
+use soundboars::app::{
+    APP_ID, App, AudioBackend, ICON_PNG, PortalFolderPicker, Services, SystemHotkeys,
+};
 use soundboars::audio::AudioEngine;
 use soundboars::config::ConfigStore;
 use soundboars::library::watch::NotifyWatcher;
@@ -21,6 +24,7 @@ fn main() -> anyhow::Result<()> {
         audio: start_audio(),
         watcher: Box::new(NotifyWatcher::new().context("could not watch folders")?),
         folder_picker: Box::new(PortalFolderPicker),
+        hotkeys: Box::new(SystemHotkeys),
         config,
     };
     let icon = eframe::icon_data::from_png_bytes(ICON_PNG).context("invalid window icon")?;
