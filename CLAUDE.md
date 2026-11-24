@@ -149,9 +149,9 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   it (`Action::Midi(MidiAction::Learn(..))`; closing the window or Esc cancels). Otherwise
   `AppState::midi_actions` turns a trigger into `Action::StopAll`/`Action::Play`, like a click.
   UI: `ui/midi_section.rs` (editor section, settings rows, shared learn widget).
-- `tests/midi_alsa.rs` needs `/dev/snd/seq` (passed through by `in-container.sh` when the host has
-  one; the kernel sequencer isn't namespaced, so the test only touches its own virtual port) and
-  runs only inside the container; it skips otherwise.
+- `tests/midi_alsa.rs` needs `/dev/snd/seq` and runs only inside the container; it skips otherwise.
+  The kernel sequencer isn't namespaced, so `in-container.sh` passes the host's through only with
+  `SOUNDBOARS_HOST_MIDI=1` (the test then only touches its own virtual port). Agents: don't set it.
 
 ## Tiling window managers
 
