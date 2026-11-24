@@ -8,6 +8,7 @@ use crate::audio::{Destination, PlayRequest, Playing};
 use crate::config::{Config, SoundConfig};
 use crate::library::{Library, Sound};
 
+use super::midi::MidiState;
 use super::sound_editor::SoundEditor;
 use super::targets::Targets;
 
@@ -30,6 +31,7 @@ pub struct AppState {
     pub settings_open: bool,
     /// The "Edit sound" window, while open.
     pub editor: Option<SoundEditor>,
+    pub midi: MidiState,
 }
 
 impl AppState {
@@ -47,6 +49,7 @@ impl AppState {
             audio_available: true,
             settings_open: false,
             editor: None,
+            midi: MidiState::default(),
         }
     }
 
@@ -131,13 +134,17 @@ impl AppState {
             .collect()
     }
 
-    /// The second line of a tile: the trimmed length once known, else the file format.
+    /// The second line of a tile: the trimmed length once known, else the file format; then what
+    /// triggers the sound, e.g. `0:01.20 · Note 36`.
     pub fn subtitle(&self, sound: &Sound) -> String {
-        let length = self.durations.get(&sound.path);
-        match (length, self.sound_config(&sound.path)) {
-            (Some(&length), Some(meta)) => format_duration(meta.trimmed_length(length)),
-            _ => sound.format(),
-        }
+        let meta = self.sound_config(&sound.path).unwrap_or_default();
+        let length = match self.durations.get(&sound.path) {
+            Some(&length) => format_duration(meta.trimmed_length(length)),
+            None => sound.format(),
+        };
+        let midi = meta.midi.map(|binding| binding.control.to_string());
+        let parts: Vec<String> = std::iter::once(length).chain(midi).collect();
+        parts.join(" · ")
     }
 
     /// Selects a tab, keeping the selection in range after tabs were removed.
@@ -170,6 +177,7 @@ mod tests {
     use super::*;
     use crate::audio::Trim;
     use crate::config::TabConfig;
+    use crate::midi::{MidiBinding, MidiControl};
 
     struct Fixture {
         _dirs: [tempfile::TempDir; 2],
@@ -195,6 +203,7 @@ mod tests {
                 volume: 0.5,
                 start_ms: 100,
                 end_ms: Some(900),
+                ..SoundConfig::default()
             },
         );
         let config = Config {
@@ -323,5 +332,17 @@ mod tests {
             "0:00.80",
             "trimmed to 0.1–0.9 s"
         );
+    }
+
+    #[test]
+    fn subtitles_show_the_midi_binding() {
+        let mut f = fixture();
+        let bruh = f.state.visible_sounds()[1].clone();
+        f.state.sound_config_mut(&bruh.path).expect("in a tab").midi = Some(MidiBinding {
+            port: None,
+            channel: 1,
+            control: MidiControl::ControlChange(20),
+        });
+        assert_eq!(f.state.subtitle(&bruh), "WAV · CC 20");
     }
 }

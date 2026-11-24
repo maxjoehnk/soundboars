@@ -16,6 +16,10 @@ use soundboars::audio::{
 };
 use soundboars::config::{Config, ConfigStore, SavedTarget, SoundConfig, TabConfig, Theme};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
+use soundboars::midi::{
+    Connection, HOTPLUG_POLL, MidiBinding, MidiControl, MidiDevice, MidiError, MidiInput, MidiPort,
+    MidiService, OnMessage,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
@@ -136,10 +140,43 @@ impl FolderPicker for FakePicker {
     }
 }
 
+/// MIDI input ports; a connected port's callback receives what the test sends.
+#[derive(Default)]
+struct MidiWorld {
+    ports: Vec<MidiPort>,
+    /// The callbacks of the connected ports, by port id.
+    listeners: Vec<(String, OnMessage)>,
+}
+
+#[derive(Clone, Default)]
+struct FakeMidi(Arc<Mutex<MidiWorld>>);
+
+impl FakeMidi {
+    fn with<R>(&self, f: impl FnOnce(&mut MidiWorld) -> R) -> R {
+        f(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl MidiInput for FakeMidi {
+    fn ports(&mut self) -> Result<Vec<MidiPort>, MidiError> {
+        Ok(self.with(|world| world.ports.clone()))
+    }
+
+    fn connect(&mut self, port: &MidiPort, on_message: OnMessage) -> Result<Connection, MidiError> {
+        self.with(|world| world.listeners.push((port.id.clone(), on_message)));
+        Ok(Box::new(()))
+    }
+}
+
+const MPD: &str = "MPD218:MPD218 MIDI 1";
+const MPD_ID: &str = "20:0";
+
 /// Two tabs: `Memes` (Airhorn, Bruh) and `SFX` (Applause, Horn). Airhorn has a volume and a trim.
+/// One MIDI port, the MPD218.
 struct Setup {
     dir: tempfile::TempDir,
     shared: Shared,
+    midi: FakeMidi,
     store: ConfigStore,
 }
 
@@ -164,6 +201,7 @@ impl Setup {
                 volume: 0.5,
                 start_ms: 100,
                 end_ms: Some(900),
+                ..SoundConfig::default()
             },
         );
         let store = ConfigStore::new(dir.path().join("config/config.toml"));
@@ -172,9 +210,17 @@ impl Setup {
             ..Config::default()
         };
         store.save(&config).expect("save config");
+        let midi = FakeMidi::default();
+        midi.with(|world| {
+            world.ports.push(MidiPort {
+                id: MPD_ID.to_owned(),
+                name: MPD.to_owned(),
+            })
+        });
         Self {
             dir,
             shared: Shared::default(),
+            midi,
             store,
         }
     }
@@ -204,15 +250,22 @@ impl Setup {
         &self,
         audio: Result<Box<dyn AudioBackend>, String>,
     ) -> Harness<'static, App> {
-        let services = Services {
+        let mut services = Services {
             audio,
             watcher: Box::new(FakeWatcher(self.shared.clone())),
             folder_picker: Box::new(FakePicker(self.shared.clone())),
             config: self.store.clone(),
+            midi: None,
         };
+        let midi = Box::new(self.midi.clone());
         let mut harness = Harness::builder()
             .with_size([1000.0, 700.0])
-            .build_eframe(|_cc| App::new(services));
+            .build_eframe(|cc| {
+                let ctx = cc.egui_ctx.clone();
+                let wake = move || ctx.request_repaint();
+                services.midi = Some(MidiService::start(midi, HOTPLUG_POLL, wake).expect("thread"));
+                App::new(services)
+            });
         harness.run();
         harness
     }
@@ -601,7 +654,10 @@ fn airhorn(setup: &Setup) -> PathBuf {
 
 /// Opens the editor for Airhorn through the tile's context menu.
 fn open_editor(harness: &mut Harness<'_, App>) {
-    harness.get_by_label(&tile("Airhorn")).click_secondary();
+    // The tile's subtitle may go on with the MIDI binding.
+    harness
+        .get_by_label_contains(&tile("Airhorn"))
+        .click_secondary();
     harness.run();
     harness.get_by_label("✏ Edit…").click();
     harness.run();
@@ -751,6 +807,7 @@ fn trim_can_be_typed_in_and_saving_to_the_end_stores_no_end() {
             volume: 0.5,
             start_ms: 250,
             end_ms: None,
+            ..SoundConfig::default()
         }
     );
 }
@@ -788,6 +845,7 @@ fn saved_changes_are_played() {
             volume: 0.8,
             start_ms: 500,
             end_ms: Some(900),
+            ..SoundConfig::default()
         }
     );
     setup.shared.clear_calls();
@@ -878,4 +936,242 @@ fn preview_plays_the_edited_sound_locally_and_stops_on_close() {
     assert!(harness.query_by_label(EDITOR).is_none());
     assert_eq!(setup.shared.calls(), [Call::StopPreview]);
     assert_eq!(saved_airhorn(&setup).start_ms, 100);
+}
+
+// MIDI. The fake MPD218 is the only port; tests that need it connected select it in the config.
+
+fn listening_to_mpd(config: &mut Config) {
+    config.settings.midi_input = MidiDevice::Port(MPD.to_owned());
+}
+
+fn note_36(port: Option<&str>) -> MidiBinding {
+    MidiBinding {
+        port: port.map(str::to_owned),
+        channel: 1,
+        control: MidiControl::Note(36),
+    }
+}
+
+/// Sends a message from the MPD218 once the app listens to it, and lets the app handle it.
+fn send_midi(setup: &Setup, harness: &mut Harness<'_, App>, message: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sent = setup.midi.with(|world| {
+            let listener = world.listeners.iter_mut().find(|(id, _)| id == MPD_ID);
+            listener
+                .map(|(_, on_message)| on_message(message))
+                .is_some()
+        });
+        if sent {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the app never connected to the MPD218"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run();
+    }
+    harness.run();
+}
+
+fn plays(setup: &Setup) -> Vec<PathBuf> {
+    let calls = setup.shared.calls();
+    calls
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Play(request) => Some(request.path),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_note_learned_in_the_editor_is_saved_and_shown_on_the_tile() {
+    let setup = Setup::new().with_config(listening_to_mpd);
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label("—").is_some(), "not bound");
+
+    click_editor_button(&mut harness, "Learn");
+    assert!(harness.query_by_label("Cancel learning").is_some());
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+
+    assert!(plays(&setup).is_empty(), "learning doesn't play");
+    assert!(harness.query_by_label("Cancel learning").is_none());
+    assert!(harness.query_by_label("Note 36 · ch 1 · MPD218").is_some());
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).midi, Some(note_36(Some(MPD))));
+    assert!(harness.query_by_label("Airhorn\nWAV · Note 36").is_some());
+}
+
+#[test]
+fn a_bound_trigger_plays_the_sound_like_a_click() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let mut harness = setup.start();
+    setup.shared.clear_calls();
+
+    send_midi(&setup, &mut harness, &[0x80, 36, 0]);
+    send_midi(&setup, &mut harness, &[0x90, 37, 100]);
+    assert!(setup.shared.calls().is_empty());
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+
+    assert_eq!(
+        setup.shared.calls(),
+        [Call::Play(PlayRequest {
+            path: airhorn(&setup),
+            trim: Some(Trim {
+                start_ms: 100,
+                end_ms: Some(900)
+            }),
+            volume: 0.5,
+            destination: Destination::Everywhere,
+        })]
+    );
+}
+
+#[test]
+fn learning_can_be_cancelled_with_escape() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        config.tabs[0].sounds.insert(
+            "Bruh.wav".to_owned(),
+            SoundConfig {
+                midi: Some(note_36(None)),
+                ..SoundConfig::default()
+            },
+        );
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Learn");
+    harness.key_press(eframe::egui::Key::Escape);
+    harness.run();
+    assert!(harness.query_by_label("Cancel learning").is_none());
+
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+    assert_eq!(plays(&setup), [setup.folder("Memes").join("Bruh.wav")]);
+    assert!(harness.query_by_label("—").is_some(), "not bound");
+}
+
+#[test]
+fn a_binding_can_be_cleared() {
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label("Note 36 · ch 1 · MPD218").is_some());
+
+    click_editor_button(&mut harness, "Clear");
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).midi, None);
+}
+
+#[test]
+fn a_binding_can_react_to_any_device() {
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav").expect("bound");
+        airhorn.midi = Some(note_36(Some(MPD)));
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+
+    click_editor_button(&mut harness, "Any device");
+    assert!(harness.query_by_label("Note 36 · ch 1").is_some());
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).midi, Some(note_36(None)));
+}
+
+#[test]
+fn learning_a_binding_another_sound_uses_warns() {
+    let setup = Setup::new().with_config(|config| {
+        listening_to_mpd(config);
+        config.tabs[1].sounds.insert(
+            "Horn.wav".to_owned(),
+            SoundConfig {
+                midi: Some(note_36(None)),
+                ..SoundConfig::default()
+            },
+        );
+    });
+    let mut harness = setup.start();
+    open_editor_with_waveform(&setup, &mut harness);
+    assert!(harness.query_by_label_contains("Also triggers").is_none());
+
+    click_editor_button(&mut harness, "Learn");
+    send_midi(&setup, &mut harness, &[0x90, 36, 100]);
+
+    assert!(harness.query_by_label("⚠ Also triggers: Horn").is_some());
+    click_editor_button(&mut harness, "Save");
+    assert_eq!(saved_airhorn(&setup).midi, Some(note_36(Some(MPD))));
+}
+
+#[test]
+fn the_midi_input_is_chosen_in_the_settings_and_remembered() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    assert_eq!(
+        harness.get_by_label("MIDI input:").value().as_deref(),
+        Some("(none)")
+    );
+    assert!(harness.query_by_label("nothing").is_some());
+
+    harness.get_by_label("MIDI input:").click();
+    harness.run();
+    harness.get_by_label(MPD).click();
+    harness.run();
+
+    assert_eq!(
+        setup.config().settings.midi_input,
+        MidiDevice::Port(MPD.to_owned())
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.query_by_label("nothing").is_some() {
+        assert!(Instant::now() < deadline, "never connected");
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run();
+    }
+    assert!(harness.query_by_label(MPD).is_some());
+}
+
+#[test]
+fn stop_all_can_be_learned_in_the_settings() {
+    let setup = Setup::new().with_config(listening_to_mpd);
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    setup.shared.clear_calls();
+
+    harness.get_by_label("Learn").click();
+    harness.run();
+    send_midi(&setup, &mut harness, &[0xB0, 20, 127]);
+
+    assert!(setup.shared.calls().is_empty(), "learning doesn't stop");
+    let learned = MidiBinding {
+        port: Some(MPD.to_owned()),
+        channel: 1,
+        control: MidiControl::ControlChange(20),
+    };
+    assert_eq!(setup.config().settings.midi_stop_all, Some(learned));
+    assert!(harness.query_by_label("CC 20 · ch 1 · MPD218").is_some());
+
+    send_midi(&setup, &mut harness, &[0xB0, 20, 0]);
+    send_midi(&setup, &mut harness, &[0xB0, 20, 127]);
+    assert_eq!(setup.shared.calls(), [Call::StopAll]);
+
+    harness.get_by_label("Clear").click();
+    harness.run();
+    assert_eq!(setup.config().settings.midi_stop_all, None);
 }

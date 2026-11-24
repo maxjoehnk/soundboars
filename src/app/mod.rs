@@ -2,6 +2,7 @@
 //! services, let [`ui`] draw the state and collect [`Action`]s, then apply them. Drawing never
 //! changes state or talks to services itself.
 
+mod midi;
 mod services;
 mod sound_editor;
 mod state;
@@ -19,7 +20,9 @@ use crate::audio::{EngineEvent, Retrigger, Waveform};
 use crate::config::{ConfigStore, SavedTarget, Settings, TabConfig, Theme};
 use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
+use crate::midi::{MidiEvent, MidiService, MidiTrigger};
 
+pub use midi::{LearnTarget, MidiAction, MidiState};
 pub use services::{AudioBackend, FolderPicker, PortalFolderPicker};
 pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
@@ -55,6 +58,7 @@ pub enum Action {
     /// Opens the "Edit sound" window for the sound at this path.
     EditSound(PathBuf),
     Editor(EditorAction),
+    Midi(MidiAction),
 }
 
 /// A change to [`Settings`].
@@ -97,6 +101,8 @@ pub struct Services {
     pub watcher: Box<dyn FolderWatcher>,
     pub folder_picker: Box<dyn FolderPicker>,
     pub config: ConfigStore,
+    /// `None` if its thread couldn't start.
+    pub midi: Option<MidiService>,
 }
 
 pub struct App {
@@ -104,6 +110,7 @@ pub struct App {
     audio: Option<Box<dyn AudioBackend>>,
     watcher: Box<dyn FolderWatcher>,
     folder_picker: Box<dyn FolderPicker>,
+    midi: Option<MidiService>,
     picked_folders: (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>),
     store: ConfigStore,
     /// Measures the sounds for their tiles; `None` if its thread couldn't start.
@@ -137,6 +144,7 @@ impl App {
             audio,
             watcher: services.watcher,
             folder_picker: services.folder_picker,
+            midi: services.midi,
             picked_folders: mpsc::channel(),
             store: services.config,
             durations: start_duration_probe(),
@@ -146,6 +154,7 @@ impl App {
         app.watch_tabs();
         app.measure_sounds();
         app.apply_settings();
+        app.select_midi_input();
         for error in &app.state.errors {
             tracing::warn!("{error}");
         }
@@ -167,6 +176,10 @@ impl App {
         }
         for event in self.watcher.poll() {
             self.folder_event(event);
+        }
+        let midi_events = self.midi.as_ref().map(MidiService::poll);
+        for event in midi_events.into_iter().flatten() {
+            self.midi_event(event);
         }
         while let Ok(folder) = self.picked_folders.1.try_recv() {
             self.add_tab(folder);
@@ -195,7 +208,12 @@ impl App {
                 .pick_folder(self.picked_folders.0.clone()),
             Action::RemoveTab(tab) => self.remove_tab(tab),
             Action::ChangeSetting(setting) => self.change_setting(setting),
-            Action::ShowSettings(open) => self.state.settings_open = open,
+            Action::ShowSettings(open) => {
+                self.state.settings_open = open;
+                if !open {
+                    self.state.midi.stop_learning(LearnTarget::StopAll);
+                }
+            }
             Action::DismissError(index) => {
                 if index < self.state.errors.len() {
                     self.state.errors.remove(index);
@@ -203,6 +221,7 @@ impl App {
             }
             Action::EditSound(path) => self.edit_sound(&path),
             Action::Editor(action) => self.editor_action(action),
+            Action::Midi(action) => self.midi_action(action),
         }
     }
 
@@ -293,8 +312,61 @@ impl App {
 
     /// Closes the editor, if open, discarding unsaved changes and stopping its preview.
     fn close_editor(&mut self) {
+        self.state.midi.stop_learning(LearnTarget::Sound);
         if self.state.editor.take().is_some() {
             self.with_audio(|audio| audio.stop_preview());
+        }
+    }
+
+    fn midi_event(&mut self, event: MidiEvent) {
+        match event {
+            MidiEvent::Ports(ports) => self.state.midi.ports = ports,
+            MidiEvent::Connected(ports) => self.state.midi.connected = ports,
+            MidiEvent::Trigger(trigger) => self.midi_trigger(&trigger),
+            MidiEvent::Error(message) => self.show_error(message),
+        }
+    }
+
+    /// Learns the trigger while learning, else acts on it like a click would.
+    fn midi_trigger(&mut self, trigger: &MidiTrigger) {
+        match self.state.midi.learn(trigger) {
+            Some((LearnTarget::Sound, binding)) => {
+                if let Some(editor) = &mut self.state.editor {
+                    editor.midi_learned(binding);
+                }
+            }
+            Some((LearnTarget::StopAll, binding)) => {
+                self.state.config.settings.midi_stop_all = Some(binding);
+                self.unsaved = true;
+            }
+            None => {
+                for action in self.state.midi_actions(trigger) {
+                    self.apply(action);
+                }
+            }
+        }
+    }
+
+    fn midi_action(&mut self, action: MidiAction) {
+        match action {
+            MidiAction::SelectInput(device) => {
+                self.state.config.settings.midi_input = device;
+                self.select_midi_input();
+                self.unsaved = true;
+            }
+            MidiAction::Learn(target) => self.state.midi.learning = Some(target),
+            MidiAction::CancelLearn => self.state.midi.learning = None,
+            MidiAction::ClearStopAll => {
+                self.state.config.settings.midi_stop_all = None;
+                self.unsaved = true;
+            }
+        }
+    }
+
+    /// Tells the MIDI thread which ports to listen to.
+    fn select_midi_input(&self) {
+        if let Some(midi) = &self.midi {
+            midi.select(self.state.config.settings.midi_input.clone());
         }
     }
 

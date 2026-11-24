@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{Destination, PlayRequest, Playing, Trim, Waveform};
 use crate::config::SoundConfig;
+use crate::midi::MidiBinding;
 
 /// The shortest trimmed sound the handles allow.
 pub const MIN_LENGTH_MS: u64 = 50;
@@ -23,6 +24,9 @@ pub enum EditorAction {
     Release,
     /// Play the whole sound again.
     Reset,
+    ClearMidi,
+    /// Whether the MIDI binding reacts to any port or only to the one it was learned from.
+    MidiAnyDevice(bool),
     Preview,
     StopPreview,
     Save,
@@ -58,6 +62,9 @@ pub struct SoundEditor {
     pub grabbed: Option<Handle>,
     /// Where the last preview started, for the playhead.
     pub preview_start_ms: u64,
+    /// As learned or saved, with its port if it has one; see [`Self::midi_binding`].
+    pub midi: Option<MidiBinding>,
+    pub midi_any_device: bool,
 }
 
 impl SoundEditor {
@@ -76,6 +83,8 @@ impl SoundEditor {
             waveform: WaveformState::Loading,
             grabbed: None,
             preview_start_ms: 0,
+            midi: saved.midi.clone(),
+            midi_any_device: saved.midi.as_ref().is_some_and(|midi| midi.port.is_none()),
         }
     }
 
@@ -130,6 +139,8 @@ impl SoundEditor {
                 self.start_ms = 0;
                 self.end_ms = self.duration_ms();
             }
+            EditorAction::ClearMidi => self.midi = None,
+            EditorAction::MidiAnyDevice(any) => self.midi_any_device = any,
             EditorAction::Preview
             | EditorAction::StopPreview
             | EditorAction::Save
@@ -154,13 +165,28 @@ impl SoundEditor {
         self.preview_start_ms + duration_ms(elapsed.min(preview.duration))
     }
 
-    /// Writes the volume and trim into `config`: a trim to the end of the sound is stored as no
-    /// end, so the whole sound is played without any trim at all.
+    /// Binds the sound to a learned trigger.
+    pub fn midi_learned(&mut self, binding: MidiBinding) {
+        self.midi = Some(binding);
+    }
+
+    /// The binding to save: without its port when it should react to any device.
+    pub fn midi_binding(&self) -> Option<MidiBinding> {
+        let mut binding = self.midi.clone()?;
+        if self.midi_any_device {
+            binding.port = None;
+        }
+        Some(binding)
+    }
+
+    /// Writes the volume, trim and MIDI binding into `config`: a trim to the end of the sound is
+    /// stored as no end, so the whole sound is played without any trim at all.
     pub fn apply_to(&self, config: &mut SoundConfig) {
         let trim = self.trim().unwrap_or_default();
         config.volume = self.volume;
         config.start_ms = trim.start_ms;
         config.end_ms = trim.end_ms;
+        config.midi = self.midi_binding();
     }
 
     /// The edited trim, `None` for the whole sound.
@@ -234,6 +260,7 @@ pub fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiControl;
 
     const SOUND_MS: u64 = 2_000;
 
@@ -249,6 +276,7 @@ mod tests {
             volume: 0.5,
             start_ms,
             end_ms,
+            ..SoundConfig::default()
         };
         let mut editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
         editor.waveform_loaded(Ok(waveform()));
@@ -271,6 +299,7 @@ mod tests {
             volume: 0.5,
             start_ms: 100,
             end_ms: None,
+            ..SoundConfig::default()
         };
         let editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
         assert_eq!(editor.name, "Air horn.mp3");
@@ -363,6 +392,7 @@ mod tests {
                 volume: 0.8,
                 start_ms: 0,
                 end_ms: None,
+                ..SoundConfig::default()
             }
         );
         editor.apply(EditorAction::Start(300));
@@ -375,6 +405,42 @@ mod tests {
             (saved(&editor).start_ms, saved(&editor).end_ms),
             (300, Some(1_200))
         );
+    }
+
+    #[test]
+    fn midi_bindings_are_learned_cleared_and_saved() {
+        let mut editor = editor(0, None);
+        assert_eq!(editor.midi_binding(), None);
+        let learned = MidiBinding {
+            port: Some("MPD218:MPD218 MIDI 1".to_owned()),
+            channel: 1,
+            control: MidiControl::Note(36),
+        };
+        editor.midi_learned(learned.clone());
+        assert_eq!(saved(&editor).midi, Some(learned.clone()));
+
+        editor.apply(EditorAction::MidiAnyDevice(true));
+        let any_port = MidiBinding {
+            port: None,
+            ..learned.clone()
+        };
+        assert_eq!(saved(&editor).midi, Some(any_port.clone()));
+        editor.apply(EditorAction::MidiAnyDevice(false));
+        assert_eq!(saved(&editor).midi, Some(learned));
+
+        let reopened = SoundEditor::open(&editor.path, &saved(&editor));
+        assert!(!reopened.midi_any_device);
+        let mut reopened = SoundEditor::open(
+            &editor.path,
+            &SoundConfig {
+                midi: Some(any_port),
+                ..SoundConfig::default()
+            },
+        );
+        assert!(reopened.midi_any_device);
+
+        reopened.apply(EditorAction::ClearMidi);
+        assert_eq!(saved(&reopened).midi, None);
     }
 
     #[test]

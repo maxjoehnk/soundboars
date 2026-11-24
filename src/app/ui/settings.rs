@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use super::dialog::Dialog;
+use super::midi_section;
 use crate::app::{Action, AppState, Setting};
 use crate::audio::Retrigger;
 use crate::config::{Settings, Theme};
@@ -14,13 +15,16 @@ pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
     let dialog = Dialog {
         id: "settings",
         title: "Settings",
-        size: [400.0, 90.0],
+        size: [560.0, 190.0],
     };
     let closed = dialog.show(ctx, |ui| {
         egui::Grid::new("settings")
             .num_columns(2)
             .spacing([16.0, 8.0])
-            .show(ui, |ui| rows(ui, &state.config.settings, actions));
+            .show(ui, |ui| {
+                rows(ui, &state.config.settings, actions);
+                midi_section::settings_rows(ui, state, actions);
+            });
     });
     if closed {
         actions.push(Action::ShowSettings(false));

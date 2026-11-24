@@ -5,6 +5,7 @@ use std::time::Instant;
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 use super::dialog::Dialog;
+use super::midi_section::midi_section;
 use crate::app::sound_editor::{self, EditorAction, SoundEditor, WaveformState};
 use crate::app::{Action, AppState, format_duration};
 use crate::audio::Waveform;
@@ -19,7 +20,7 @@ pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
     let dialog = Dialog {
         id: "sound editor",
         title: &title,
-        size: [680.0, 270.0],
+        size: [680.0, 320.0],
     };
     if dialog.show(ctx, |ui| body(ui, state, editor, actions)) {
         actions.push(Action::Editor(EditorAction::Close));
@@ -30,6 +31,7 @@ fn body(ui: &mut egui::Ui, state: &AppState, editor: &SoundEditor, actions: &mut
     name_section(ui, editor);
     trim_section(ui, state, editor, actions);
     volume_section(ui, editor, actions);
+    midi_section(ui, state, editor, actions);
     ui.separator();
     buttons(ui, actions);
 }

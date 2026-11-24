@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{RecordingApp, Retrigger, Trim};
+use crate::midi::{MidiBinding, MidiDevice};
 
 /// Overrides where the config file lives (e.g. for tests).
 pub const CONFIG_PATH_ENV: &str = "SOUNDBOARS_CONFIG";
@@ -33,6 +34,10 @@ pub struct Settings {
     pub local_enabled: bool,
     pub retrigger: Retrigger,
     pub theme: Theme,
+    /// The MIDI ports to listen to.
+    pub midi_input: MidiDevice,
+    /// Stops all sounds.
+    pub midi_stop_all: Option<MidiBinding>,
 }
 
 impl Default for Settings {
@@ -43,6 +48,8 @@ impl Default for Settings {
             local_enabled: true,
             retrigger: Retrigger::default(),
             theme: Theme::default(),
+            midi_input: MidiDevice::default(),
+            midi_stop_all: None,
         }
     }
 }
@@ -124,6 +131,7 @@ pub struct SoundConfig {
     #[serde(skip_serializing_if = "is_zero")]
     pub start_ms: u64,
     pub end_ms: Option<u64>,
+    pub midi: Option<MidiBinding>,
 }
 
 impl Default for SoundConfig {
@@ -132,6 +140,7 @@ impl Default for SoundConfig {
             volume: 1.0,
             start_ms: 0,
             end_ms: None,
+            midi: None,
         }
     }
 }
@@ -269,6 +278,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiControl;
 
     fn store() -> (tempfile::TempDir, ConfigStore) {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -301,6 +311,11 @@ mod tests {
                 volume: 0.5,
                 start_ms: 250,
                 end_ms: Some(1500),
+                midi: Some(MidiBinding {
+                    port: Some("MPD218:MPD218 MIDI 1".to_owned()),
+                    channel: 10,
+                    control: MidiControl::Note(36),
+                }),
             },
         );
         Config {
@@ -310,6 +325,12 @@ mod tests {
                 local_enabled: false,
                 retrigger: Retrigger::Restart,
                 theme: Theme::Light,
+                midi_input: MidiDevice::Port("MPD218:MPD218 MIDI 1".to_owned()),
+                midi_stop_all: Some(MidiBinding {
+                    port: None,
+                    channel: 1,
+                    control: MidiControl::ControlChange(20),
+                }),
             },
             target: Some(SavedTarget {
                 process_binary: Some("Discord".to_owned()),
@@ -348,6 +369,7 @@ mod tests {
         assert!(text.contains("theme = \"light\""), "{text}");
         assert!(text.contains("[tabs.sounds.\"airhorn.mp3\"]"), "{text}");
         assert!(text.contains("call_volume = 0.8"), "{text}");
+        assert!(text.contains("note = 36"), "{text}");
     }
 
     #[test]
