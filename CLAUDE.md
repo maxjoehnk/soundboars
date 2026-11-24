@@ -107,8 +107,8 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   count, full decode as fallback); tiles show the trimmed length (`SoundConfig::trimmed_length`).
 - `app`: `App` owns `AppState` (pure, unit-tested logic: visible sounds, play requests, progress)
   plus `Services` (`AudioBackend` = `AudioEngine` or a fake, `FolderWatcher`, `FolderPicker`,
-  `ConfigStore`). Each frame: `poll()` services → `ui::draw(&AppState) -> Vec<Action>` → `apply()`
-  → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
+  `ConfigStore`, `Downloader`). Each frame: `poll()` services → `ui::draw(&AppState) ->
+  Vec<Action>` → `apply()` → save config when dirty and no pointer button is held. UI code (`app/ui/*`) only reads state
   and emits `Action`s; it never mutates state or calls services. Settings go through
   `Action::ChangeSetting(Setting)`. `app::targets::Targets` decides auto-relinking.
 - Dialogs are OS windows: `ui::dialog::Dialog { id, title, size }.show(ctx, |ui| …)` opens an
@@ -130,6 +130,29 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   Xvfb (wgpu on Mesa lavapipe). Icons in labels come from egui's bundled emoji fonts
   (`egui/monochrome_emoji_fonts`); kittest panics on glyphs no bundled font has.
 
+## URL import
+
+- `import::Downloader` (in `Services`; one download at a time, polled per frame → `DownloadEvent::
+  {Progress(Stage), Done(path), Failed(message)}`); impl `import::ytdlp::YtDlp`, fakes in tests.
+  `YtDlp::new()` checks `$PATH` for `yt-dlp`, `ffmpeg`, `ffprobe` once; if any is missing, the
+  "🔗 Add from URL" button is disabled with the reason as tooltip (`AppState::url_import_unavailable`).
+- yt-dlp runs without a shell (`ytdlp::command`, args pinned by a unit test): `--ignore-config`,
+  `--no-playlist`, `-x --audio-format mp3`, `--windows-filenames --trim-filenames 120`,
+  `--no-overwrites`, output `%(title)s.%(ext)s`. Progress comes from our own `--progress-template`
+  / `--print post_process:` / `--print after_move:%(filepath)s` lines on stdout; the error message
+  is yt-dlp's `ERROR:` lines (else its last stderr lines).
+- It works in a hidden staging folder inside the tab folder (`--paths temp:…/.soundboars-download-*`,
+  a `TempDir`), so `.part`/intermediate files never show up as sounds and the finished MP3 arrives
+  by rename. Cancel (or dropping `YtDlp`) kills yt-dlp's process group (incl. ffmpeg) and removes
+  the staging folder. A file with the same name is kept, not overwritten; yt-dlp reports it as done,
+  so the editor opens the existing file.
+- Dialog: `app/url_import.rs` (state, URL check: http(s) with a host) + `app/ui/url_import.rs`.
+  **Closing it (Cancel or the window's close button) cancels a running download.** Without tabs it
+  offers "➕ Add folder". On `Done` it closes, selects the file's tab and runs `Action::EditSound`.
+- Tests: `tests/url_import.rs` runs the real yt-dlp against an HTTP server inside the test on
+  127.0.0.1 (no network; container only); GUI tests use a fake downloader. The animated progress
+  bar never lets kittest settle, so those tests use `run_steps`.
+
 ## Tiling window managers
 
 winit doesn't set a parent for dialog windows on Wayland, so tiling compositors tile them. Users
@@ -137,7 +160,7 @@ can float them by app ID (`me.maxjoehnk.soundboars`) and title, e.g. Hyprland 0.
 syntax changes between versions — see the wiki for yours):
 
 ```
-windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|Edit sound.*)$, float on
+windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|Edit sound.*|Add sound from URL)$, float on
 ```
 
 ## Milestones
