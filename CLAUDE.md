@@ -146,7 +146,7 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
 - `hotkeys` (library side): `Hotkey` (egui `Key` + Ctrl/Alt/Shift/Super) is stored in the config
   in one canonical format, `Ctrl+Alt+Shift+Super+<egui key name>` (e.g. `Ctrl+Shift+F13`); an
   invalid one is dropped with a warning instead of rejecting the file. Only keys with an X11
-  keysym (`hotkey::keysym` table) can be hotkeys; it also yields the XDG `preferred_trigger`
+  keysym (`hotkey::keysym`) can be hotkeys; it also yields the XDG `preferred_trigger`
   (`CTRL+SHIFT+F13`) and Hyprland key (`CTRL + SHIFT + F13`) formats. egui doesn't report Super on
   Linux, so Super can only be typed into the config.
 - `trait HotkeyBackend { register(&[Binding]), capabilities() }`: `register` replaces the whole set.
