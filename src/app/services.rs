@@ -14,6 +14,8 @@ pub trait AudioBackend {
     fn stop_all(&self);
     fn stop_preview(&self);
     fn load_waveform(&self, path: &Path);
+    /// Keeps the sounds at `paths` decoded in memory (see [`AudioEngine::preload`]).
+    fn preload(&self, paths: Vec<PathBuf>);
     fn set_call_volume(&self, volume: f32);
     fn set_local_volume(&self, volume: f32);
     fn set_local_enabled(&self, enabled: bool);
@@ -59,6 +61,10 @@ impl AudioBackend for AudioEngine {
 
     fn load_waveform(&self, path: &Path) {
         AudioEngine::load_waveform(self, path);
+    }
+
+    fn preload(&self, paths: Vec<PathBuf>) {
+        AudioEngine::preload(self, paths);
     }
 
     fn set_call_volume(&self, volume: f32) {

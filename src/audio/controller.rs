@@ -2,7 +2,7 @@
 //! for both output streams, waits for decodes, and keeps track of what's playing. Runs on the
 //! engine's control thread; never on a real-time thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
@@ -101,6 +101,7 @@ pub enum Message {
     StopAll,
     StopPreview,
     LoadWaveform(PathBuf),
+    Preload(Vec<PathBuf>),
     SetCallVolume(f32),
     SetLocalVolume(f32),
     SetLocalEnabled(bool),
@@ -182,6 +183,7 @@ impl Controller {
             Message::StopAll => self.stop_all(),
             Message::StopPreview => self.stop_preview(),
             Message::LoadWaveform(path) => self.load_waveform(path),
+            Message::Preload(paths) => self.preload(paths),
             Message::SetCallVolume(volume) => {
                 self.call_volume = volume.clamp(0.0, 1.0);
                 self.update_inject_gain();
@@ -227,6 +229,16 @@ impl Controller {
                 self.waiting.push(request);
             }
         }
+    }
+
+    /// Decodes `paths` in the background (after any sound someone waits for) and forgets the
+    /// decoded sounds that aren't among them.
+    fn preload(&mut self, paths: Vec<PathBuf>) {
+        for path in &paths {
+            self.cache.preload(path);
+        }
+        self.cache
+            .retain(&paths.into_iter().collect::<HashSet<_>>());
     }
 
     fn decoded(&mut self, decoded: Decoded) {
@@ -662,6 +674,28 @@ mod tests {
             destination: Destination::Everywhere,
         }));
         assert_eq!(fixture.inject.plays().len(), 2);
+    }
+
+    #[test]
+    fn preloaded_sounds_play_right_away_and_unlisted_ones_are_dropped() {
+        let mut fixture = Fixture::new();
+        fixture.send(Message::Preload(vec!["a.wav".into(), "bad.wav".into()]));
+        fixture.finish_decode();
+        fixture.finish_decode();
+        assert!(fixture.events().is_empty(), "preload failures are silent");
+
+        let play = PlayRequest {
+            path: "a.wav".into(),
+            trim: None,
+            volume: 1.0,
+            destination: Destination::Everywhere,
+        };
+        fixture.send(Message::Play(play.clone()));
+        assert_eq!(fixture.inject.plays().len(), 1);
+
+        fixture.send(Message::Preload(Vec::new()));
+        fixture.send(Message::Play(play));
+        assert!(fixture.inject.plays().is_empty(), "waits for a new decode");
     }
 
     #[test]

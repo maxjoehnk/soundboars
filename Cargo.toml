@@ -52,3 +52,11 @@ unimplemented = "warn"
 unwrap_used = "warn"
 undocumented_unsafe_blocks = "warn"
 print_stdout = "warn"
+
+# Decoding and resampling (symphonia, rubato) are ~10x slower unoptimized, so dev builds optimize
+# dependencies, and our crate a little: rubato's generic resampler is compiled as part of it.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -45,6 +45,8 @@ struct World {
     calls: Vec<Call>,
     engine_events: Vec<EngineEvent>,
     playing: Vec<Playing>,
+    /// The sounds last asked to be kept decoded.
+    preloaded: Vec<PathBuf>,
     watched: Vec<PathBuf>,
     folder_events: Vec<FolderEvent>,
     folder_to_pick: Option<PathBuf>,
@@ -100,6 +102,9 @@ impl AudioBackend for FakeAudio {
     }
     fn load_waveform(&self, path: &Path) {
         self.0.call(Call::LoadWaveform(path.to_owned()));
+    }
+    fn preload(&self, paths: Vec<PathBuf>) {
+        self.0.with(|world| world.preloaded = paths);
     }
     fn set_call_volume(&self, volume: f32) {
         self.0.call(Call::SetCallVolume(volume));
@@ -688,6 +693,28 @@ fn folder_changes_update_tiles_and_invalidate_sounds() {
 
     assert!(harness.query_by_label(&tile("Vine Boom")).is_some());
     assert_eq!(setup.shared.calls(), [Call::Invalidate(path)]);
+}
+
+#[test]
+fn listed_sounds_are_kept_decoded() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    let preloaded = || {
+        let mut paths = setup.shared.with(|world| world.preloaded.clone());
+        paths.sort();
+        paths
+    };
+    assert!(preloaded().contains(&airhorn(&setup)));
+    let sfx = setup.folder("SFX");
+    assert!(preloaded().iter().any(|path| path.starts_with(&sfx)));
+
+    harness.get_by_label("SFX").click_secondary();
+    harness.run();
+    harness.get_by_label("Remove tab").click();
+    harness.run();
+
+    assert!(preloaded().contains(&airhorn(&setup)));
+    assert!(!preloaded().iter().any(|path| path.starts_with(&sfx)));
 }
 
 #[test]

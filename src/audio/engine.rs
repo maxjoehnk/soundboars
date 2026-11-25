@@ -1,7 +1,7 @@
 //! [`AudioEngine`]: what the app uses to play sounds. It runs a control thread that owns the sound
 //! cache and talks to the mixers of both output streams (see [`super::controller`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -87,6 +87,12 @@ impl AudioEngine {
     /// needed); it arrives as [`EngineEvent::Waveform`].
     pub fn load_waveform(&self, path: &Path) {
         self.send(Message::LoadWaveform(path.to_owned()));
+    }
+
+    /// Decodes the sounds at `paths` in the background, so they play right away; decoded sounds
+    /// not among them are forgotten. Sounds that are played meanwhile are decoded first.
+    pub fn preload(&self, paths: Vec<PathBuf>) {
+        self.send(Message::Preload(paths));
     }
 
     /// Volume of what the linked app receives, `0.0..=1.0`.

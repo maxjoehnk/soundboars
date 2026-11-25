@@ -196,7 +196,7 @@ impl App {
             hotkeys,
         };
         app.watch_tabs();
-        app.measure_sounds();
+        app.library_changed();
         app.apply_settings();
         app.sync_hotkeys();
         app.select_midi_input();
@@ -378,7 +378,7 @@ impl App {
         if self.state.library.find(path).is_none() {
             // E.g. a file that was just downloaded, before the folder watcher reported it.
             self.state.library.changed(path);
-            self.measure_sounds();
+            self.library_changed();
         }
         let Some(saved) = self.state.sound_config(path) else {
             self.show_error(format!("{} is not in any tab", path.display()));
@@ -514,15 +514,15 @@ impl App {
         match event {
             FolderEvent::Listing(path) => {
                 self.state.library.changed(&path);
-                self.measure_sounds();
+                self.library_changed();
             }
             FolderEvent::Contents(path) => {
                 self.state.durations.remove(&path);
                 if let Some(durations) = &mut self.durations {
                     durations.forget(&path);
                 }
-                self.measure_sounds();
                 self.with_audio(|audio| audio.invalidate(&path));
+                self.library_changed();
             }
         }
     }
@@ -574,7 +574,7 @@ impl App {
         }
         self.watch(&dir);
         self.state.library.add(dir.clone());
-        self.measure_sounds();
+        self.library_changed();
         self.state.config.tabs.push(TabConfig::for_folder(dir));
         self.state.select_tab(self.state.config.tabs.len() - 1);
         self.unsaved = true;
@@ -587,6 +587,7 @@ impl App {
         let removed = self.state.config.tabs.remove(tab);
         self.state.library.remove(tab);
         self.watcher.unwatch(&removed.path);
+        self.library_changed();
         self.state.select_tab(self.state.tab);
         self.unsaved = true;
     }
@@ -602,6 +603,15 @@ impl App {
         for dir in dirs {
             self.watch(&dir);
         }
+    }
+
+    /// Follows a change of the library's sounds: measures the new ones and keeps exactly the
+    /// listed ones decoded, so they play right away.
+    fn library_changed(&mut self) {
+        self.measure_sounds();
+        let sounds = self.state.library.folders().iter().flat_map(|f| &f.sounds);
+        let paths = sounds.map(|sound| sound.path.clone()).collect();
+        self.with_audio(|audio| audio.preload(paths));
     }
 
     /// Starts measuring the sounds whose length isn't known yet (each sound only once).

@@ -1,9 +1,10 @@
 //! Caches decoded sounds by path and decodes missing ones on a background worker thread, so the
-//! caller never blocks on decoding.
+//! caller never blocks on decoding. Sounds someone waits for ([`SoundCache::load`]) are decoded
+//! before those that are only preloaded ([`SoundCache::preload`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use super::decode::{DecodeError, Samples};
@@ -22,12 +23,49 @@ struct Job {
     request: u64,
 }
 
+/// The decodes still to do, shared with the worker thread. The worker takes them from the front.
+#[derive(Default)]
+struct Queue {
+    state: Mutex<QueueState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct QueueState {
+    jobs: VecDeque<Job>,
+    /// Set when the cache is dropped: the worker stops.
+    closed: bool,
+}
+
+impl Queue {
+    fn lock(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits for the next job; `None` once the queue is closed.
+    fn next(&self) -> Option<Job> {
+        let mut state = self.lock();
+        loop {
+            if state.closed {
+                return None;
+            }
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 pub struct SoundCache {
     sounds: HashMap<PathBuf, Samples>,
     /// Paths being decoded, with the request whose result counts.
     pending: HashMap<PathBuf, u64>,
     next_request: u64,
-    jobs: mpsc::Sender<Job>,
+    queue: Arc<Queue>,
 }
 
 impl SoundCache {
@@ -38,11 +76,12 @@ impl SoundCache {
         decode: impl Fn(&Path) -> Result<Samples, DecodeError> + Send + 'static,
         on_decoded: impl Fn(Decoded) + Send + 'static,
     ) -> std::io::Result<Self> {
-        let (jobs, job_rx) = mpsc::channel::<Job>();
+        let queue = Arc::<Queue>::default();
+        let worker_queue = Arc::clone(&queue);
         thread::Builder::new()
             .name("sound-decoder".to_owned())
             .spawn(move || {
-                for Job { path, request } in job_rx {
+                while let Some(Job { path, request }) = worker_queue.next() {
                     let result = decode(&path);
                     on_decoded(Decoded {
                         path,
@@ -55,7 +94,7 @@ impl SoundCache {
             sounds: HashMap::new(),
             pending: HashMap::new(),
             next_request: 0,
-            jobs,
+            queue,
         })
     }
 
@@ -63,19 +102,38 @@ impl SoundCache {
         self.sounds.get(path)
     }
 
-    /// Starts decoding `path` in the background unless it's cached or already being decoded.
+    /// Decodes `path` in the background, before any preloads, unless it's cached. A queued
+    /// preload of it moves to the front.
     pub fn load(&mut self, path: &Path) {
+        if self.sounds.contains_key(path) {
+            return;
+        }
+        let queue = Arc::clone(&self.queue);
+        let mut state = queue.lock();
+        let queued = state.jobs.iter().position(|job| job.path == path);
+        if let Some(job) = queued.and_then(|index| state.jobs.remove(index)) {
+            state.jobs.push_front(job);
+        } else if !self.pending.contains_key(path) {
+            state.jobs.push_front(self.new_job(path));
+            queue.changed.notify_one();
+        }
+    }
+
+    /// Decodes `path` in the background after everything queued before, unless it's cached or
+    /// already being decoded.
+    pub fn preload(&mut self, path: &Path) {
         if self.sounds.contains_key(path) || self.pending.contains_key(path) {
             return;
         }
-        let request = self.next_request;
-        self.next_request += 1;
-        self.pending.insert(path.to_owned(), request);
-        // Fails only if the worker panicked; then this path just never finishes loading.
-        let _ = self.jobs.send(Job {
-            path: path.to_owned(),
-            request,
-        });
+        let job = self.new_job(path);
+        self.queue.lock().jobs.push_back(job);
+        self.queue.changed.notify_one();
+    }
+
+    /// Forgets the cached sounds that `keep` doesn't contain, to free their memory. Decodes that
+    /// are running or queued are left alone.
+    pub fn retain(&mut self, keep: &HashSet<PathBuf>) {
+        self.sounds.retain(|path, _| keep.contains(path));
     }
 
     /// Takes in a background result: caches the sound and returns the result, or returns `None` if
@@ -92,16 +150,35 @@ impl SoundCache {
     }
 
     /// Forgets `path`, e.g. because the file changed on disk. A decode of it that is still running
-    /// won't be cached; [`Self::load`] decodes it afresh.
+    /// won't be cached and a queued one is dropped; [`Self::load`] decodes it afresh.
     pub fn invalidate(&mut self, path: &Path) {
         self.sounds.remove(path);
         self.pending.remove(path);
+        self.queue.lock().jobs.retain(|job| job.path != path);
+    }
+
+    /// Registers a decode of `path` as pending; the caller queues the job.
+    fn new_job(&mut self, path: &Path) -> Job {
+        let request = self.next_request;
+        self.next_request += 1;
+        self.pending.insert(path.to_owned(), request);
+        Job {
+            path: path.to_owned(),
+            request,
+        }
+    }
+}
+
+impl Drop for SoundCache {
+    fn drop(&mut self) {
+        self.queue.lock().closed = true;
+        self.queue.changed.notify_all();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use super::*;
@@ -192,6 +269,9 @@ mod tests {
         let path = Path::new("abc");
         let held = gate.lock().expect("gate");
         cache.load(path);
+        while !cache.queue.lock().jobs.is_empty() {
+            thread::yield_now(); // until the worker took the job and waits at the gate
+        }
         cache.invalidate(path);
         cache.load(path);
         drop(held);
@@ -200,5 +280,58 @@ mod tests {
         assert!(cache.get(path).is_none());
         assert!(cache.finish(next(&rx)).is_some(), "fresh result");
         assert!(cache.get(path).is_some());
+    }
+
+    #[test]
+    fn loads_jump_ahead_of_preloads() {
+        let gate = Arc::new(Mutex::new(()));
+        let (mut cache, rx) = cache_with(Arc::clone(&gate));
+        let held = gate.lock().expect("gate");
+        for name in ["a", "bb", "ccc"] {
+            cache.preload(Path::new(name));
+        }
+        cache.load(Path::new("ccc"));
+        drop(held);
+
+        let order: Vec<PathBuf> = (0..3).map(|_| next(&rx).path).collect();
+        let position = |name: &str| order.iter().position(|path| path == Path::new(name));
+        assert!(position("ccc") < position("bb"), "{order:?}");
+    }
+
+    #[test]
+    fn preloading_a_cached_or_pending_sound_does_nothing() {
+        let (mut cache, rx) = cache();
+        cache.load(Path::new("abc"));
+        cache.preload(Path::new("abc"));
+        cache.finish(next(&rx));
+        cache.preload(Path::new("abc"));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn retain_forgets_other_sounds() {
+        let (mut cache, rx) = cache();
+        for name in ["a", "bb"] {
+            cache.preload(Path::new(name));
+            cache.finish(next(&rx));
+        }
+        cache.retain(&HashSet::from([PathBuf::from("a")]));
+        assert!(cache.get(Path::new("a")).is_some());
+        assert!(cache.get(Path::new("bb")).is_none());
+    }
+
+    #[test]
+    fn invalidate_drops_a_queued_decode() {
+        let gate = Arc::new(Mutex::new(()));
+        let (mut cache, rx) = cache_with(Arc::clone(&gate));
+        let held = gate.lock().expect("gate");
+        cache.preload(Path::new("a"));
+        cache.preload(Path::new("bb"));
+        cache.invalidate(Path::new("bb"));
+        drop(held);
+
+        let first = next(&rx);
+        assert_eq!(first.path, Path::new("a"));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     }
 }
