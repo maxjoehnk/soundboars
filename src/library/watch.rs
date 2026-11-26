@@ -16,7 +16,7 @@ pub enum FolderEvent {
 }
 
 /// Reports changes in the folders it watches. The app polls it once per frame.
-pub trait FolderWatcher {
+pub trait FolderWatcher: Send {
     fn watch(&mut self, dir: &Path) -> Result<(), notify::Error>;
     fn unwatch(&mut self, dir: &Path);
     /// The changes since the last call.

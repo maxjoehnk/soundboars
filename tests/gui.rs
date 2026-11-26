@@ -10,7 +10,9 @@ use eframe::egui::accesskit::Role;
 use eframe::egui::{Key, Modifiers, Pos2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
-use soundboars::app::{App, AudioBackend, FolderPicker, HotkeyBackends, Player, Services};
+use soundboars::app::{
+    App, AppWindows, AudioBackend, FolderPicker, HotkeyBackends, Player, Services,
+};
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
@@ -332,14 +334,14 @@ impl Setup {
         config
     }
 
-    fn start(&self) -> Harness<'static, App> {
+    fn start(&self) -> Harness<'static, AppWindows> {
         self.start_with_audio(Ok(Box::new(FakeAudio(self.shared.clone()))))
     }
 
     fn start_with_audio(
         &self,
         audio: Result<Box<dyn AudioBackend>, String>,
-    ) -> Harness<'static, App> {
+    ) -> Harness<'static, AppWindows> {
         let services = Services {
             audio,
             watcher: Box::new(FakeWatcher(self.shared.clone())),
@@ -351,7 +353,7 @@ impl Setup {
         };
         let mut harness = Harness::builder()
             .with_size([1000.0, 700.0])
-            .build_eframe(|cc| App::new(services, &cc.egui_ctx));
+            .build_eframe(|cc| AppWindows::new(App::new(services, &cc.egui_ctx)));
         harness.run();
         harness
     }
@@ -368,7 +370,7 @@ fn discord(node_id: u32) -> RecordingApp {
 }
 
 /// What the target picker shows as selected.
-fn target_picker_value(harness: &Harness<'_, App>) -> String {
+fn target_picker_value(harness: &Harness<'_, AppWindows>) -> String {
     harness
         .get_by_label("Inject into:")
         .value()
@@ -761,7 +763,7 @@ fn airhorn(setup: &Setup) -> PathBuf {
 }
 
 /// Opens the editor for Airhorn through the tile's context menu.
-fn open_editor(harness: &mut Harness<'_, App>) {
+fn open_editor(harness: &mut Harness<'_, AppWindows>) {
     // The tile's subtitle may go on with the MIDI binding and the hotkey.
     harness
         .get_by_label_contains(&tile("Airhorn"))
@@ -772,13 +774,13 @@ fn open_editor(harness: &mut Harness<'_, App>) {
 }
 
 /// Opens the editor for Airhorn and delivers its waveform.
-fn open_editor_with_waveform(setup: &Setup, harness: &mut Harness<'_, App>) {
+fn open_editor_with_waveform(setup: &Setup, harness: &mut Harness<'_, AppWindows>) {
     open_editor(harness);
     deliver_waveform(setup, harness);
 }
 
 /// The engine reports Airhorn's waveform.
-fn deliver_waveform(setup: &Setup, harness: &mut Harness<'_, App>) {
+fn deliver_waveform(setup: &Setup, harness: &mut Harness<'_, AppWindows>) {
     let waveform = Waveform {
         peaks: vec![
             Peak {
@@ -804,13 +806,13 @@ fn saved_airhorn(setup: &Setup) -> SoundConfig {
 }
 
 /// The point on the waveform at `ms`.
-fn waveform_point(harness: &Harness<'_, App>, ms: u64) -> Pos2 {
+fn waveform_point(harness: &Harness<'_, AppWindows>, ms: u64) -> Pos2 {
     let rect = harness.get_by_label("Waveform").rect();
     let x = rect.left() + rect.width() * ms as f32 / AIRHORN_MS as f32;
     Pos2::new(x, rect.center().y)
 }
 
-fn drag(harness: &mut Harness<'_, App>, from_ms: u64, to_ms: u64) {
+fn drag(harness: &mut Harness<'_, AppWindows>, from_ms: u64, to_ms: u64) {
     let from = waveform_point(harness, from_ms);
     let to = waveform_point(harness, to_ms);
     harness.hover_at(from);
@@ -823,7 +825,7 @@ fn drag(harness: &mut Harness<'_, App>, from_ms: u64, to_ms: u64) {
     harness.run();
 }
 
-fn click_editor_button(harness: &mut Harness<'_, App>, label: &str) {
+fn click_editor_button(harness: &mut Harness<'_, AppWindows>, label: &str) {
     harness.get_by_label(label).click();
     harness.run();
 }
@@ -1067,7 +1069,7 @@ fn registered(setup: &Setup) -> Vec<Binding> {
 }
 
 /// The backend reports a hotkey event, and the app runs a frame.
-fn hotkey_event(setup: &Setup, harness: &mut Harness<'_, App>, event: HotkeyEvent) {
+fn hotkey_event(setup: &Setup, harness: &mut Harness<'_, AppWindows>, event: HotkeyEvent) {
     report_hotkey(setup, event);
     harness.run();
 }
@@ -1092,7 +1094,11 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
 
 /// Runs frames until `done`. Hotkeys and MIDI triggers are handled on their own thread, so what
 /// they do shows up a moment later.
-fn run_until(harness: &mut Harness<'_, App>, what: &str, done: impl Fn(&Harness<'_, App>) -> bool) {
+fn run_until(
+    harness: &mut Harness<'_, AppWindows>,
+    what: &str,
+    done: impl Fn(&Harness<'_, AppWindows>) -> bool,
+) {
     let deadline = Instant::now() + Duration::from_secs(10);
     harness.run();
     while !done(harness) {
@@ -1441,7 +1447,7 @@ fn note_36(port: Option<&str>) -> MidiBinding {
 
 /// Sends a message from the MPD218 once the app listens to it, and runs a frame. What the message
 /// triggers happens on the `triggers` thread, so check its effects with [`run_until`].
-fn send_midi(setup: &Setup, harness: &mut Harness<'_, App>, message: &[u8]) {
+fn send_midi(setup: &Setup, harness: &mut Harness<'_, AppWindows>, message: &[u8]) {
     midi_message(setup, message);
     harness.run();
 }
@@ -1696,7 +1702,7 @@ const DOWNLOAD: &str = "⬇ Download";
 /// settles for `Harness::run`.
 const STEPS: usize = 4;
 
-fn report_download(setup: &Setup, harness: &mut Harness<'_, App>, event: DownloadEvent) {
+fn report_download(setup: &Setup, harness: &mut Harness<'_, AppWindows>, event: DownloadEvent) {
     setup.shared.with(|world| world.download_events.push(event));
     harness.run_steps(STEPS);
 }
@@ -1709,7 +1715,7 @@ fn cancelled_downloads(setup: &Setup) -> usize {
     setup.shared.with(|world| world.cancelled_downloads)
 }
 
-fn type_url(harness: &mut Harness<'_, App>, url: &str) {
+fn type_url(harness: &mut Harness<'_, AppWindows>, url: &str) {
     let field = harness.get_by_label(URL_FIELD);
     field.click();
     field.type_text(url);
@@ -1717,7 +1723,7 @@ fn type_url(harness: &mut Harness<'_, App>, url: &str) {
 }
 
 /// Opens the dialog and types `url`.
-fn enter_url(harness: &mut Harness<'_, App>, url: &str) {
+fn enter_url(harness: &mut Harness<'_, AppWindows>, url: &str) {
     harness.get_by_label(ADD_FROM_URL).click();
     harness.run_steps(STEPS);
     type_url(harness, url);

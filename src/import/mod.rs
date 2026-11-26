@@ -28,7 +28,7 @@ pub enum DownloadEvent {
 }
 
 /// Downloads the audio of one URL at a time. The app polls it once per frame.
-pub trait Downloader {
+pub trait Downloader: Send {
     /// Why downloads can't work (e.g. missing tools), as checked at startup.
     fn unavailable(&self) -> Option<String>;
     /// Starts downloading the audio of `url` as MP3 into `folder`, cancelling a running download.

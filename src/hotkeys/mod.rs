@@ -108,7 +108,7 @@ impl BindHint {
 }
 
 /// Registers bindings with the desktop. Events go to the [`EventSink`] it was started with.
-pub trait HotkeyBackend {
+pub trait HotkeyBackend: Send {
     /// Replaces all registered bindings with `bindings`.
     fn register(&mut self, bindings: &[Binding]);
     fn capabilities(&self) -> Capabilities;

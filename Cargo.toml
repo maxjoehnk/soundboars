@@ -60,3 +60,8 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# eframe with a patch that lets dialog windows close themselves while the main window is hidden;
+# see vendor/README.md.
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

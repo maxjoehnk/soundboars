@@ -4,7 +4,7 @@
 use anyhow::Context as _;
 use eframe::egui;
 use soundboars::app::{
-    APP_ID, App, AudioBackend, ICON_PNG, PortalFolderPicker, Services, SystemHotkeys,
+    APP_ID, App, AppWindows, AudioBackend, ICON_PNG, PortalFolderPicker, Services, SystemHotkeys,
 };
 use soundboars::audio::AudioEngine;
 use soundboars::config::ConfigStore;
@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "SoundBoars",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(services, &cc.egui_ctx)))),
+        Box::new(|cc| Ok(Box::new(AppWindows::new(App::new(services, &cc.egui_ctx))))),
     )
     .map_err(|error| anyhow::anyhow!("could not open the window: {error}"))
 }

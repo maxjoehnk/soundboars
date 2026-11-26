@@ -12,18 +12,48 @@ mod url_import;
 
 use eframe::egui;
 
+pub use dialog::Dialog;
+
 use super::{Action, AppState};
 
-pub fn draw(ui: &mut egui::Ui, state: &AppState) -> Vec<Action> {
+/// The app's windows: the main one and the dialogs, each an OS window of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum View {
+    Main,
+    Settings,
+    SoundEditor,
+    UrlImport,
+}
+
+/// Draws the window `view` (a closed dialog draws nothing).
+pub fn draw(ui: &mut egui::Ui, state: &AppState, view: View) -> Vec<Action> {
     let mut actions = Vec::new();
-    top_bar::show(ui, state, &mut actions);
-    error_bar(ui, state, &mut actions);
-    bottom_bar::show(ui, state, &mut actions);
-    egui::CentralPanel::default().show(ui, |ui| board::show(ui, state, &mut actions));
-    settings::show(ui.ctx(), state, &mut actions);
-    sound_editor::show(ui.ctx(), state, &mut actions);
-    url_import::show(ui.ctx(), state, &mut actions);
+    match view {
+        View::Main => main_window(ui, state, &mut actions),
+        View::Settings => settings::body(ui, state, &mut actions),
+        View::SoundEditor => sound_editor::body(ui, state, &mut actions),
+        View::UrlImport => url_import::body(ui, state, &mut actions),
+    }
     actions
+}
+
+/// The dialogs that are open.
+pub fn dialogs(state: &AppState) -> Vec<Dialog> {
+    [
+        settings::dialog(state),
+        sound_editor::dialog(state),
+        url_import::dialog(state),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn main_window(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    top_bar::show(ui, state, actions);
+    error_bar(ui, state, actions);
+    bottom_bar::show(ui, state, actions);
+    egui::CentralPanel::default().show(ui, |ui| board::show(ui, state, actions));
 }
 
 fn error_bar(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {

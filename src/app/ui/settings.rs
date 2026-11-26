@@ -2,7 +2,8 @@
 
 use eframe::egui;
 
-use super::dialog::Dialog;
+use super::View;
+use super::dialog::{Dialog, close_requested};
 use super::hotkey_section::{RecorderEvent, bind_hint, recorder};
 use super::midi_section;
 use crate::app::{Action, AppState, STOP_ALL_ID, Setting};
@@ -10,27 +11,28 @@ use crate::audio::Retrigger;
 use crate::config::Theme;
 use crate::hotkeys::BackendKind;
 
-pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
+pub fn dialog(state: &AppState) -> Option<Dialog> {
+    state.settings_open.then(|| Dialog {
+        view: View::Settings,
+        title: "Settings".to_owned(),
+        size: [560.0, 340.0],
+    })
+}
+
+pub fn body(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
     if !state.settings_open {
         return;
     }
-    let dialog = Dialog {
-        id: "settings",
-        title: "Settings",
-        size: [560.0, 340.0],
-    };
-    let closed = dialog.show(ctx, |ui| {
-        egui::Grid::new("settings")
-            .num_columns(2)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                rows(ui, state, actions);
-                midi_section::settings_rows(ui, state, actions);
-            });
-        ui.separator();
-        hotkey_settings(ui, state, actions);
-    });
-    if closed {
+    egui::Grid::new("settings")
+        .num_columns(2)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            rows(ui, state, actions);
+            midi_section::settings_rows(ui, state, actions);
+        });
+    ui.separator();
+    hotkey_settings(ui, state, actions);
+    if close_requested(ui) {
         actions.push(Action::ShowSettings(false));
     }
 }

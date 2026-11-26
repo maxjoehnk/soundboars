@@ -14,7 +14,7 @@ mod ui;
 mod url_import;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 use eframe::egui;
@@ -37,6 +37,7 @@ pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
 pub use targets::{NO_APPS_HINT, Targets};
 use triggers::{Dispatcher, Trigger};
+use ui::{Dialog, View};
 pub use url_import::{ImportStatus, UrlImport, UrlImportAction};
 
 /// The app ID of all windows (Wayland app ID, X11 class), and the portal's and `.desktop` file's.
@@ -696,20 +697,78 @@ fn start_duration_probe() -> Option<DurationProbe> {
         .ok()
 }
 
-impl eframe::App for App {
+/// The eframe app. The main window and every open dialog are drawn in passes of their own
+/// (deferred viewports), each over the shared [`App`]: Wayland compositors don't draw hidden
+/// windows, and a dialog drawn as part of the main window would freeze while it's hidden.
+pub struct AppWindows(Arc<Mutex<App>>);
+
+impl AppWindows {
+    pub fn new(app: App) -> Self {
+        Self(Arc::new(Mutex::new(app)))
+    }
+}
+
+/// Closes the OS window of the dialog `view` when it was drawn in a pass of its own and isn't open
+/// anymore (Save, Cancel, …). The main window would drop it with its next pass, but that may only
+/// come much later: Wayland compositors don't let hidden windows draw. Needs our eframe patch
+/// (`vendor/README.md`). Embedded dialogs (tests) are drawn in the main window's pass and go away
+/// on their own.
+fn close_if_gone(ctx: &egui::Context, view: View, open: &[Dialog]) {
+    let own_window = ctx.viewport_id() != egui::ViewportId::ROOT;
+    if view != View::Main && own_window && !open.iter().any(|dialog| dialog.view == view) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+/// Locks the app for one pass. Passes run one after another on the UI thread; a panic in one
+/// leaves the app as usable as it was before.
+fn lock(app: &Mutex<App>) -> MutexGuard<'_, App> {
+    app.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl eframe::App for AppWindows {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Unlocked before showing the dialogs: embedded ones (tests) are drawn right away.
+        let dialogs = lock(&self.0).frame(ui, View::Main);
+        for dialog in dialogs {
+            let app = Arc::clone(&self.0);
+            let view = dialog.view;
+            dialog.show(ui.ctx(), move |ui| {
+                lock(&app).frame(ui, view);
+            });
+        }
+    }
+}
+
+impl App {
+    /// One pass of the window `view`: takes in what happened in the background, draws the window
+    /// and applies what the user did. Returns the open dialogs.
+    fn frame(&mut self, ui: &mut egui::Ui, view: View) -> Vec<Dialog> {
         let ctx = ui.ctx().clone();
         self.poll();
         self.apply_theme(&ctx);
-        let actions = ui::draw(ui, &self.state);
-        if !actions.is_empty() {
-            // Show the new state right away, not with the next poll.
-            ctx.request_repaint();
-        }
+        let actions = ui::draw(ui, &self.state, view);
+        let changed = !actions.is_empty();
         for action in actions {
             self.apply(action);
         }
+        let dialogs = ui::dialogs(&self.state);
+        close_if_gone(&ctx, view, &dialogs);
+        if changed {
+            // Show the new state in every window right away, not with their next poll.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            for dialog in &dialogs {
+                ctx.request_repaint_of(dialog.viewport_id());
+            }
+        }
         self.save_if_idle(&ctx);
+        self.schedule_repaint(&ctx);
+        dialogs
+    }
+
+    /// Redraws the current window soon while something moves (playing sounds, a loading waveform,
+    /// a download), else now and then to pick up background events.
+    fn schedule_repaint(&self, ctx: &egui::Context) {
         let loading = self
             .state
             .editor

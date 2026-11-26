@@ -9,7 +9,7 @@ use crate::audio::{AudioEngine, EngineEvent, PlayHandle, PlayRequest, Playing, R
 use crate::hotkeys::{self, BackendKind, EventSink, HotkeyBackend};
 
 /// What the UI needs from [`AudioEngine`]. Every call returns right away.
-pub trait AudioBackend {
+pub trait AudioBackend: Send {
     fn play(&self, request: PlayRequest);
     fn stop_all(&self);
     fn stop_preview(&self);
@@ -109,7 +109,7 @@ impl AudioBackend for AudioEngine {
 }
 
 /// Asks the user for a folder.
-pub trait FolderPicker {
+pub trait FolderPicker: Send {
     /// Opens the dialog without blocking; the chosen folder, if any, is sent to `picked`.
     fn pick_folder(&self, picked: mpsc::Sender<PathBuf>);
 }
@@ -139,7 +139,7 @@ impl FolderPicker for PortalFolderPicker {
 }
 
 /// Starts hotkey backends; switching the backend in the settings starts a new one.
-pub trait HotkeyBackends {
+pub trait HotkeyBackends: Send {
     /// The backend of `kind` (`None` for [`BackendKind::Off`]), sending its events to `events`.
     fn start(
         &self,

@@ -3,25 +3,30 @@
 
 use eframe::egui;
 
-use super::dialog::Dialog;
+use super::View;
+use super::dialog::{Dialog, close_requested};
 use crate::app::url_import::{check_url, stage_fraction, stage_text};
 use crate::app::{Action, AppState, ImportStatus, UrlImport, UrlImportAction};
 
-pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
+pub fn dialog(state: &AppState) -> Option<Dialog> {
+    state.url_import.as_ref().map(|_| Dialog {
+        view: View::UrlImport,
+        title: "Add sound from URL".to_owned(),
+        size: [480.0, 200.0],
+    })
+}
+
+pub fn body(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
     let Some(import) = &state.url_import else {
         return;
     };
-    let dialog = Dialog {
-        id: "url import",
-        title: "Add sound from URL",
-        size: [480.0, 200.0],
-    };
-    if dialog.show(ctx, |ui| body(ui, state, import, actions)) {
+    contents(ui, state, import, actions);
+    if close_requested(ui) {
         actions.push(Action::UrlImport(UrlImportAction::Close));
     }
 }
 
-fn body(ui: &mut egui::Ui, state: &AppState, import: &UrlImport, actions: &mut Vec<Action>) {
+fn contents(ui: &mut egui::Ui, state: &AppState, import: &UrlImport, actions: &mut Vec<Action>) {
     if state.config.tabs.is_empty() {
         no_tab(ui, actions);
         return;

@@ -1,10 +1,11 @@
-//! The "Edit sound" window. Every section is one function, called in order from [`body`].
+//! The "Edit sound" window. Every section is one function, called in order from [`sections`].
 
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
-use super::dialog::Dialog;
+use super::View;
+use super::dialog::{Dialog, close_requested};
 use super::hotkey_section::hotkey_section;
 use super::midi_section::midi_section;
 use crate::app::sound_editor::{self, EditorAction, SoundEditor, WaveformState};
@@ -13,22 +14,26 @@ use crate::audio::Waveform;
 
 const WAVEFORM_HEIGHT: f32 = 120.0;
 
-pub fn show(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
+pub fn dialog(state: &AppState) -> Option<Dialog> {
+    state.editor.as_ref().map(|editor| Dialog {
+        view: View::SoundEditor,
+        title: format!("Edit sound – {}", editor.name),
+        size: [680.0, 390.0],
+    })
+}
+
+pub fn body(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
     let Some(editor) = &state.editor else {
         return;
     };
-    let title = format!("Edit sound – {}", editor.name);
-    let dialog = Dialog {
-        id: "sound editor",
-        title: &title,
-        size: [680.0, 390.0],
-    };
-    if dialog.show(ctx, |ui| body(ui, state, editor, actions)) {
+    sections(ui, state, editor, actions);
+    if close_requested(ui) {
         actions.push(Action::Editor(EditorAction::Close));
     }
 }
 
-fn body(ui: &mut egui::Ui, state: &AppState, editor: &SoundEditor, actions: &mut Vec<Action>) {
+/// One function per section of the window, in order.
+fn sections(ui: &mut egui::Ui, state: &AppState, editor: &SoundEditor, actions: &mut Vec<Action>) {
     name_section(ui, editor);
     trim_section(ui, state, editor, actions);
     volume_section(ui, editor, actions);

@@ -1,0 +1,98 @@
+--- a/crates/eframe/src/native/wgpu_integration.rs
++++ b/crates/eframe/src/native/wgpu_integration.rs
+@@ -93,6 +93,11 @@
+ 
+     /// Passed on to each [`egui_winit::State`]. See [`NativeOptions::clipboard_shortcuts`].
+     clipboard_shortcuts: bool,
++
++    /// SoundBoars patch: deferred viewports that closed themselves (a pass of their own ended
++    /// with a close request), mapped to their parent. Their window is gone; they stay closed
++    /// until the parent's next pass decides again whether to show them.
++    closed_viewports: HashMap<ViewportId, ViewportId>,
+ }
+ 
+ pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
+@@ -373,6 +378,7 @@
+             focused_viewport: Some(ViewportId::ROOT),
+             resized_viewport: None,
+             clipboard_shortcuts: self.native_options.clipboard_shortcuts,
++            closed_viewports: HashMap::default(),
+         }));
+ 
+         {
+@@ -768,6 +774,8 @@
+ 
+         // ------------------------------------------------------------
+ 
++        let close_requested = raw_input.viewport().close_requested();
++
+         // Runs the update, which could call immediate viewports,
+         // so make sure we hold no locks here!
+         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+@@ -781,6 +789,7 @@
+             viewports,
+             painter,
+             viewport_from_window,
++            closed_viewports,
+             ..
+         } = &mut *shared_mut;
+ 
+@@ -789,11 +798,19 @@
+             textures_delta,
+             shapes,
+             pixels_per_point,
+-            viewport_output,
++            mut viewport_output,
+         } = full_output;
+ 
+         pending_deltas.append(textures_delta);
+ 
++        forget_closed_viewports(
++            closed_viewports,
++            viewports,
++            viewport_id,
++            close_requested,
++            &mut viewport_output,
++        );
++
+         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
+ 
+         // Synchronization between the integration layer and the painter layer
+@@ -1327,6 +1344,37 @@
+     );
+ }
+ 
++/// SoundBoars patch: lets a deferred viewport close its own window, instead of waiting for its
++/// parent's next pass (which may never come while the parent's window is hidden on Wayland).
++///
++/// After the pass of `viewport_id`: its own closed children are up to it again; if the pass ended
++/// with a close request (a [`egui::ViewportCommand::Close`] for itself, or the user closing the
++/// window without [`egui::ViewportCommand::CancelClose`]), it is closed. Closed viewports are
++/// removed from `viewport_output`, so the caller prunes their window.
++fn forget_closed_viewports(
++    closed_viewports: &mut HashMap<ViewportId, ViewportId>,
++    viewports: &Viewports,
++    viewport_id: ViewportId,
++    close_requested: bool,
++    viewport_output: &mut OrderedViewportIdMap<egui::ViewportOutput>,
++) {
++    closed_viewports.retain(|_, parent| *parent != viewport_id);
++    let commands = viewport_output
++        .get(&viewport_id)
++        .map(|output| output.commands.as_slice())
++        .unwrap_or_default();
++    let closes = commands.contains(&egui::ViewportCommand::Close)
++        || (close_requested && !commands.contains(&egui::ViewportCommand::CancelClose));
++    if viewport_id != ViewportId::ROOT
++        && closes
++        && let Some(viewport) = viewports.get(&viewport_id)
++    {
++        log::debug!("Viewport {viewport_id:?} closed itself");
++        closed_viewports.insert(viewport_id, viewport.ids.parent);
++    }
++    viewport_output.retain(|id, _| !closed_viewports.contains_key(id));
++}
++
+ pub(crate) fn remove_viewports_not_in(
+     viewports: &mut Viewports,
+     painter: &mut egui_wgpu::winit::Painter,
