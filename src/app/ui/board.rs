@@ -56,7 +56,7 @@ fn tile(
     actions: &mut Vec<Action>,
 ) {
     let progress = state.progress(&sound.path, now);
-    let label = format!("{}\n{}", sound.name, state.subtitle(sound));
+    let label = format!("{}\n{}", state.display_name(sound), state.subtitle(sound));
     let button = egui::Button::new(label).selected(progress.is_some());
     let response = ui
         .add_enabled_ui(state.audio_available, |ui| ui.add_sized(TILE, button))
@@ -75,6 +75,10 @@ fn tile(
 fn context_menu(ui: &mut egui::Ui, sound: &Sound, actions: &mut Vec<Action>) {
     if ui.button("✏ Edit…").clicked() {
         actions.push(Action::EditSound(sound.path.clone()));
+        ui.close();
+    }
+    if ui.button("Rename…").clicked() {
+        actions.push(Action::RenameSound(sound.path.clone()));
         ui.close();
     }
 }

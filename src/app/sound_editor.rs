@@ -1,5 +1,5 @@
-//! The "Edit sound" window's state and logic: per-sound volume, the non-destructive trim and the
-//! global hotkey, edited on a copy that [`SoundEditor::apply_to`] writes into the sound's [`SoundConfig`] on save.
+//! The "Edit sound" window's state and logic: the shown name, per-sound volume, the
+//! non-destructive trim and the global hotkey, edited on a copy that [`SoundEditor::apply_to`] writes into the sound's [`SoundConfig`] on save.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,8 +13,12 @@ use crate::midi::MidiBinding;
 pub const MIN_LENGTH_MS: u64 = 50;
 
 /// What the user did in the editor (see [`super::Action::Editor`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EditorAction {
+    /// The edited name; empty shows the file name.
+    Name(String),
+    /// The name field got the keyboard focus that [`SoundEditor::focus_name`] asked for.
+    NameFocused,
     Volume(f32),
     Start(u64),
     End(u64),
@@ -63,7 +67,11 @@ pub enum WaveformState {
 pub struct SoundEditor {
     pub path: PathBuf,
     /// The file name, shown read-only.
+    pub file_name: String,
+    /// The name shown on the tile, as edited (see [`Self::saved_name`]).
     pub name: String,
+    /// The name field should take the keyboard focus (the editor was opened to rename the sound).
+    pub focus_name: bool,
     pub volume: f32,
     pub start_ms: u64,
     /// `None` plays to the end. Once the waveform (and so the length) is known, this is always set.
@@ -86,13 +94,16 @@ pub struct SoundEditor {
 impl SoundEditor {
     /// Edits the sound at `path`, starting from its saved metadata. The waveform is loading.
     pub fn open(path: &Path, saved: &SoundConfig) -> Self {
-        let name = path.file_name().map_or_else(
+        let file_name = path.file_name().map_or_else(
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
+        let name = saved.name.clone().unwrap_or_else(|| file_stem(path));
         Self {
             path: path.to_owned(),
+            file_name,
             name,
+            focus_name: false,
             volume: saved.volume,
             start_ms: saved.start_ms,
             end_ms: saved.end_ms,
@@ -141,6 +152,8 @@ impl SoundEditor {
     /// business and ignored here.
     pub fn apply(&mut self, action: EditorAction) {
         match action {
+            EditorAction::Name(name) => self.name = name,
+            EditorAction::NameFocused => self.focus_name = false,
             EditorAction::Volume(volume) => self.volume = volume.max(0.0),
             EditorAction::Start(ms) => self.set_start(ms),
             EditorAction::End(ms) => self.set_end(ms),
@@ -211,10 +224,22 @@ impl SoundEditor {
         Some(binding)
     }
 
-    /// Writes the volume, trim, MIDI binding and hotkey into `config`: a trim to the end of the
-    /// sound is stored as no end, so the whole sound is played without any trim at all.
+    /// The name to save: `None` (show the file name) when it's blank or just the file name.
+    pub fn saved_name(&self) -> Option<String> {
+        let name = self.name.trim();
+        (!name.is_empty() && name != self.file_stem()).then(|| name.to_owned())
+    }
+
+    /// The file name without extension: what the tile shows without a name of its own.
+    pub fn file_stem(&self) -> String {
+        file_stem(&self.path)
+    }
+
+    /// Writes the name, volume, trim, MIDI binding and hotkey into `config`: a trim to the end of
+    /// the sound is stored as no end, so the whole sound is played without any trim at all.
     pub fn apply_to(&self, config: &mut SoundConfig) {
         let trim = self.trim().unwrap_or_default();
+        config.name = self.saved_name();
         config.volume = self.volume;
         config.start_ms = trim.start_ms;
         config.end_ms = trim.end_ms;
@@ -287,6 +312,13 @@ pub fn x_of(ms: u64, left: f32, width: f32, duration_ms: u64) -> f32 {
     left + width * (ms.min(duration_ms) as f64 / duration_ms as f64) as f32
 }
 
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -336,11 +368,29 @@ mod tests {
             ..SoundConfig::default()
         };
         let editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
-        assert_eq!(editor.name, "Air horn.mp3");
+        assert_eq!(editor.file_name, "Air horn.mp3");
+        assert_eq!(editor.name, "Air horn");
         assert_eq!(editor.volume, 0.5);
         assert_eq!(trim(&editor), (100, None));
         assert_eq!(editor.waveform, WaveformState::Loading);
         assert_eq!(editor.duration_ms(), None);
+    }
+
+    #[test]
+    fn names_are_edited_and_saved_only_when_they_differ_from_the_file_name() {
+        let mut editor = editor(0, None);
+        assert_eq!(saved(&editor).name, None);
+        editor.apply(EditorAction::Name("  Horn of doom ".to_owned()));
+        assert_eq!(saved(&editor).name.as_deref(), Some("Horn of doom"));
+
+        let reopened = SoundEditor::open(&editor.path, &saved(&editor));
+        assert_eq!(reopened.name, "Horn of doom");
+        assert_eq!(reopened.file_name, "Air horn.mp3");
+
+        editor.apply(EditorAction::Name("Air horn".to_owned()));
+        assert_eq!(saved(&editor).name, None, "the file name");
+        editor.apply(EditorAction::Name("   ".to_owned()));
+        assert_eq!(saved(&editor).name, None, "blank");
     }
 
     #[test]

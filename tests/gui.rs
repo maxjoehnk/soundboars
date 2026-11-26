@@ -917,7 +917,7 @@ fn the_editor_opens_from_the_tile_menu_and_shows_the_waveform() {
     open_editor(&mut harness);
 
     assert!(harness.query_by_label(EDITOR).is_some());
-    assert!(harness.query_by_label("Airhorn.wav").is_some());
+    assert!(harness.query_by_label("File: Airhorn.wav").is_some());
     assert!(harness.query_by_label("Loading waveform…").is_some());
     assert!(harness.query_by_label("Waveform").is_none());
     assert_eq!(setup.shared.calls(), [Call::LoadWaveform(airhorn(&setup))]);
@@ -935,6 +935,32 @@ fn the_editor_opens_from_the_tile_menu_and_shows_the_waveform() {
         Some("0.90 s")
     );
     assert!(harness.query_by_label("Length 0:00.80").is_some());
+}
+
+#[test]
+fn renaming_shows_the_new_name_on_the_tile_and_keeps_the_file() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+
+    harness
+        .get_by_label_contains(&tile("Airhorn"))
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Rename…").click();
+    harness.run();
+
+    let field = harness.get_by_label("Name:");
+    assert!(field.is_focused());
+    assert_eq!(field.value().as_deref(), Some("Airhorn"));
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.get_by_label("Name:").type_text("Horn of doom");
+    harness.run();
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(saved_airhorn(&setup).name.as_deref(), Some("Horn of doom"));
+    assert!(airhorn(&setup).exists());
+    assert!(harness.query_by_label_contains("Horn of doom\n").is_some());
+    assert!(harness.query_by_label_contains("Airhorn\n").is_none());
 }
 
 #[test]

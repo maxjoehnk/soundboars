@@ -148,6 +148,9 @@ fn folder_name(path: &Path) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundConfig {
+    /// The name shown instead of the file name; the file itself is never renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The sound's own volume; `1.0` plays it as it is.
     pub volume: f32,
     #[serde(skip_serializing_if = "is_zero")]
@@ -169,6 +172,7 @@ pub struct SoundConfig {
 impl Default for SoundConfig {
     fn default() -> Self {
         Self {
+            name: None,
             volume: 1.0,
             start_ms: 0,
             end_ms: None,
@@ -342,6 +346,7 @@ mod tests {
         tab.sounds.insert(
             "airhorn.mp3".to_owned(),
             SoundConfig {
+                name: Some("Air horn".to_owned()),
                 volume: 0.5,
                 start_ms: 250,
                 end_ms: Some(1500),

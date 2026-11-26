@@ -44,7 +44,10 @@ pub fn bindings(config: &Config) -> Vec<(Binding, Target)> {
             }
             let binding = Binding {
                 id: id.clone(),
-                description: format!("Play {}", file_stem(key)),
+                description: format!(
+                    "Play {}",
+                    sound.name.clone().unwrap_or_else(|| file_stem(key))
+                ),
                 hotkey: sound.hotkey,
             };
             bindings.push((binding, Target::Play(tab.path.join(key))));

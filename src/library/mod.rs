@@ -137,14 +137,9 @@ impl Library {
         })
     }
 
-    /// Sounds of all tabs whose name contains `query`, ignoring case; in tab order.
-    pub fn search(&self, query: &str) -> Vec<&Sound> {
-        let query = query.trim().to_lowercase();
-        self.folders
-            .iter()
-            .flat_map(|folder| &folder.sounds)
-            .filter(|sound| sound.name.to_lowercase().contains(&query))
-            .collect()
+    /// The sounds of all tabs, in tab order.
+    pub fn sounds(&self) -> impl Iterator<Item = &Sound> {
+        self.folders.iter().flat_map(|folder| &folder.sounds)
     }
 }
 
@@ -242,23 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_names_in_all_folders_ignoring_case() {
+    fn sounds_lists_all_folders_in_order() {
         let a = tempfile::tempdir().expect("temp dir");
         let b = tempfile::tempdir().expect("temp dir");
-        touch(a.path(), "Airhorn.mp3");
         touch(a.path(), "Bruh.wav");
+        touch(a.path(), "Airhorn.mp3");
         touch(b.path(), "Fairy horn.ogg");
         let library = Library::new([a.path().to_owned(), b.path().to_owned()]);
 
-        assert_eq!(
-            library
-                .search(" HORN ")
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>(),
-            ["Airhorn", "Fairy horn"]
-        );
-        assert!(library.search("nothing").is_empty());
+        let all: Vec<&str> = library.sounds().map(|s| s.name.as_str()).collect();
+        assert_eq!(all, ["Airhorn", "Bruh", "Fairy horn"]);
     }
 
     #[test]

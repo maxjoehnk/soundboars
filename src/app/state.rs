@@ -78,13 +78,32 @@ impl AppState {
     /// the selected tab.
     pub fn visible_sounds(&self) -> Vec<&Sound> {
         if self.is_searching() {
-            return self.library.search(&self.search);
+            return self.search_results();
         }
         self.library
             .folders()
             .get(self.tab)
             .map(|folder| folder.sounds.iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Sounds of all tabs whose shown name or file name contains the search, ignoring case.
+    fn search_results(&self) -> Vec<&Sound> {
+        let query = self.search.trim().to_lowercase();
+        self.library
+            .sounds()
+            .filter(|sound| {
+                self.display_name(sound).to_lowercase().contains(&query)
+                    || sound.name.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    /// The name on the sound's tile: the one given in "Edit sound", else the file name.
+    pub fn display_name(&self, sound: &Sound) -> String {
+        self.sound_config(&sound.path)
+            .and_then(|meta| meta.name)
+            .unwrap_or_else(|| sound.name.clone())
     }
 
     /// Plays the sound at `path` with its volume and trim from the config.
@@ -145,7 +164,7 @@ impl AppState {
     pub fn now_playing(&self) -> Vec<String> {
         self.playing_on_board()
             .map(|playing| match self.library.find(&playing.path) {
-                Some((_, sound)) => sound.name.clone(),
+                Some((_, sound)) => self.display_name(sound),
                 None => file_stem(&playing.path),
             })
             .collect()
@@ -207,7 +226,7 @@ mod tests {
         state: AppState,
     }
 
-    /// Two tabs: `Memes` (Airhorn, Bruh) and `SFX` (Applause, Horn).
+    /// Two tabs: `Memes` (Airhorn, Bruh) and `SFX` (Applause, shown as "Clapping"; Horn).
     fn fixture() -> Fixture {
         let memes = tempfile::tempdir().expect("temp dir");
         let sfx = tempfile::tempdir().expect("temp dir");
@@ -230,8 +249,16 @@ mod tests {
                 ..SoundConfig::default()
             },
         );
+        let mut sfx_tab = TabConfig::for_folder(sfx.path().to_owned());
+        sfx_tab.sounds.insert(
+            "Applause.ogg".to_owned(),
+            SoundConfig {
+                name: Some("Clapping".to_owned()),
+                ..SoundConfig::default()
+            },
+        );
         let config = Config {
-            tabs: vec![memes_tab, TabConfig::for_folder(sfx.path().to_owned())],
+            tabs: vec![memes_tab, sfx_tab],
             ..Config::default()
         };
         Fixture {
@@ -259,6 +286,20 @@ mod tests {
         assert_eq!(names(f.state.visible_sounds()), ["Airhorn", "Horn"]);
         f.state.search = "  ".to_owned();
         assert_eq!(names(f.state.visible_sounds()), ["Airhorn", "Bruh"]);
+    }
+
+    #[test]
+    fn renamed_sounds_show_and_are_found_by_both_names() {
+        let mut f = fixture();
+        f.state.select_tab(1);
+        let shown: Vec<String> = (f.state.visible_sounds().iter())
+            .map(|sound| f.state.display_name(sound))
+            .collect();
+        assert_eq!(shown, ["Clapping", "Horn"]);
+        f.state.search = "CLAP".to_owned();
+        assert_eq!(names(f.state.visible_sounds()), ["Applause"]);
+        f.state.search = "applause".to_owned();
+        assert_eq!(names(f.state.visible_sounds()), ["Applause"]);
     }
 
     #[test]

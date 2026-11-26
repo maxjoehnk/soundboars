@@ -17,7 +17,7 @@ const WAVEFORM_HEIGHT: f32 = 120.0;
 pub fn dialog(state: &AppState) -> Option<Dialog> {
     state.editor.as_ref().map(|editor| Dialog {
         view: View::SoundEditor,
-        title: format!("Edit sound – {}", editor.name),
+        title: format!("Edit sound – {}", editor.file_name),
         size: [680.0, 390.0],
     })
 }
@@ -34,7 +34,7 @@ pub fn body(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
 
 /// One function per section of the window, in order.
 fn sections(ui: &mut egui::Ui, state: &AppState, editor: &SoundEditor, actions: &mut Vec<Action>) {
-    name_section(ui, editor);
+    name_section(ui, editor, actions);
     trim_section(ui, state, editor, actions);
     volume_section(ui, editor, actions);
     hotkey_section(ui, state, editor, actions);
@@ -43,10 +43,22 @@ fn sections(ui: &mut egui::Ui, state: &AppState, editor: &SoundEditor, actions: 
     buttons(ui, actions);
 }
 
-fn name_section(ui: &mut egui::Ui, editor: &SoundEditor) {
+fn name_section(ui: &mut egui::Ui, editor: &SoundEditor, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        let caption = ui.label("Sound:");
-        ui.strong(&editor.name).labelled_by(caption.id);
+        let caption = ui.label("Name:");
+        let mut name = editor.name.clone();
+        let field = egui::TextEdit::singleline(&mut name)
+            .hint_text(editor.file_stem())
+            .desired_width(240.0);
+        let response = ui.add(field).labelled_by(caption.id);
+        if response.changed() {
+            actions.push(Action::Editor(EditorAction::Name(name)));
+        }
+        if editor.focus_name {
+            response.request_focus();
+            actions.push(Action::Editor(EditorAction::NameFocused));
+        }
+        ui.weak(format!("File: {}", editor.file_name));
     });
     ui.add_space(6.0);
 }

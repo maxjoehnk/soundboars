@@ -72,6 +72,8 @@ pub enum Action {
     DismissError(usize),
     /// Opens the "Edit sound" window for the sound at this path.
     EditSound(PathBuf),
+    /// Opens the "Edit sound" window with its name field focused.
+    RenameSound(PathBuf),
     Editor(EditorAction),
     /// Starts (`true`) or cancels recording the "Stop all" hotkey in the settings.
     RecordStopAllHotkey(bool),
@@ -282,6 +284,12 @@ impl App {
                 }
             }
             Action::EditSound(path) => self.edit_sound(&path),
+            Action::RenameSound(path) => {
+                self.edit_sound(&path);
+                if let Some(editor) = &mut self.state.editor {
+                    editor.focus_name = true;
+                }
+            }
             Action::Editor(action) => self.editor_action(action),
             Action::Midi(action) => self.midi_action(action),
             Action::OpenUrlImport => {
