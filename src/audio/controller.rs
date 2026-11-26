@@ -34,7 +34,8 @@ pub struct PlayRequest {
 /// Where a sound plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Destination {
-    /// Into the linked app and, while local playback is enabled, locally.
+    /// Into the call (the linked app or the virtual microphone) and, while local playback is
+    /// enabled, locally.
     #[default]
     Everywhere,
     /// Only locally (even while local playback is disabled), never into the call: the trim
@@ -78,6 +79,9 @@ impl Playing {
 pub enum EngineEvent {
     /// The apps that currently record audio; sent whenever the list changes.
     RecordingApps(Vec<RecordingApp>),
+    /// The description of the microphone the virtual microphone mixes in, `None` if there is
+    /// none; sent whenever it changes.
+    Microphone(Option<String>),
     /// Something went wrong in PipeWire or the engine.
     Error(String),
     /// A sound started playing.
@@ -404,6 +408,7 @@ impl Controller {
                 self.update_inject_gain();
                 self.emit(EngineEvent::RecordingApps(apps));
             }
+            Event::Microphone(microphone) => self.emit(EngineEvent::Microphone(microphone)),
             Event::Error(message) => self.emit(EngineEvent::Error(message)),
         }
     }

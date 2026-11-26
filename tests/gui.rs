@@ -12,11 +12,14 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use soundboars::app::{
     App, AppWindows, AudioBackend, FolderPicker, HotkeyBackends, Player, Services,
+    VIRTUAL_MIC_LABEL,
 };
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
-use soundboars::config::{Config, ConfigStore, SavedTarget, SoundConfig, TabConfig, Theme};
+use soundboars::config::{
+    Config, ConfigStore, Injection, SavedTarget, SoundConfig, TabConfig, Theme,
+};
 use soundboars::hotkeys::{
     BackendKind, BindHint, Binding, Capabilities, EventSink, Hotkey, HotkeyBackend, HotkeyEvent,
 };
@@ -38,6 +41,7 @@ enum Call {
     SetRetrigger(Retrigger),
     Invalidate(PathBuf),
     LinkTo(u32),
+    UseVirtualMic,
     Unlink,
 }
 
@@ -125,6 +129,9 @@ impl AudioBackend for FakeAudio {
     }
     fn link_to(&self, node_id: u32) {
         self.0.call(Call::LinkTo(node_id));
+    }
+    fn use_virtual_mic(&self) {
+        self.0.call(Call::UseVirtualMic);
     }
     fn unlink(&self) {
         self.0.call(Call::Unlink);
@@ -509,6 +516,7 @@ fn an_empty_target_list_explains_when_apps_appear() {
 #[test]
 fn the_remembered_target_is_relinked_when_it_appears() {
     let setup = Setup::new().with_config(|config| {
+        config.injection = Injection::App;
         config.target = Some(SavedTarget::of(&discord(0)));
     });
     let mut harness = setup.start();
@@ -530,6 +538,76 @@ fn the_remembered_target_is_relinked_when_it_appears() {
         target_picker_value(&harness),
         "WEBRTC VoiceEngine (Discord)"
     );
+}
+
+#[test]
+fn the_virtual_mic_is_the_default_target_and_shows_the_mixed_in_microphone() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+
+    assert!(setup.shared.calls().contains(&Call::UseVirtualMic));
+    assert_eq!(target_picker_value(&harness), VIRTUAL_MIC_LABEL);
+    assert!(harness.query_by_label("no microphone found").is_some());
+
+    setup.shared.with(|world| {
+        world
+            .engine_events
+            .push(EngineEvent::Microphone(Some("USB Mic".to_owned())))
+    });
+    harness.run();
+
+    assert!(harness.query_by_label("with USB Mic").is_some());
+    assert!(harness.query_by_label("⟳").is_none());
+}
+
+#[test]
+fn switching_between_virtual_mic_and_app_keeps_the_remembered_app() {
+    let setup = Setup::new().with_config(|config| {
+        config.target = Some(SavedTarget::of(&discord(0)));
+    });
+    let mut harness = setup.start();
+    setup.shared.with(|world| {
+        world
+            .engine_events
+            .push(EngineEvent::RecordingApps(vec![discord(41)]))
+    });
+    harness.run();
+    // The virtual mic is the saved mode, so the remembered app isn't linked.
+    assert!(!setup.shared.calls().contains(&Call::LinkTo(41)));
+    setup.shared.clear_calls();
+
+    harness.get_by_label("Inject into:").click();
+    harness.run();
+    harness.get_by_label("WEBRTC VoiceEngine (Discord)").click();
+    harness.run();
+
+    assert_eq!(setup.shared.calls(), [Call::LinkTo(41)]);
+    assert_eq!(setup.config().injection, Injection::App);
+
+    harness.get_by_label("Inject into:").click();
+    harness.run();
+    harness.get_by_label(VIRTUAL_MIC_LABEL).click();
+    harness.run();
+
+    assert_eq!(
+        setup.shared.calls(),
+        [Call::LinkTo(41), Call::UseVirtualMic]
+    );
+    let config = setup.config();
+    assert_eq!(config.injection, Injection::VirtualMic);
+    assert_eq!(config.target, Some(SavedTarget::of(&discord(0))));
+    assert_eq!(target_picker_value(&harness), VIRTUAL_MIC_LABEL);
+}
+
+#[test]
+fn app_mode_starts_without_the_virtual_mic() {
+    let setup = Setup::new().with_config(|config| {
+        config.injection = Injection::App;
+    });
+    let harness = setup.start();
+
+    assert!(!setup.shared.calls().contains(&Call::UseVirtualMic));
+    assert_eq!(target_picker_value(&harness), "None");
 }
 
 #[test]

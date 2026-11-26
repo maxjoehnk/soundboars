@@ -7,9 +7,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use soundboars::audio::SAMPLE_RATE;
+use soundboars::audio::{Event, RecordingApp, SAMPLE_RATE};
 
 pub const FAKE_BINARY: &str = "fakevoice";
 /// The null sink `scripts/test-headless.sh` sets up as the default sink.
@@ -58,6 +59,15 @@ impl Recorder {
         )
     }
 
+    /// Records the node named `target`, linked by the session manager like any recording app.
+    pub fn recording(wav: &Path, target: &str) -> Self {
+        Self::start(
+            wav,
+            &["--target", target],
+            "{ application.name = TestRecorder }",
+        )
+    }
+
     /// Records what is played on the headless null sink (its monitor).
     pub fn sink_monitor(wav: &Path) -> Self {
         Self::start(
@@ -82,7 +92,12 @@ impl Recorder {
     }
 
     /// Stops recording cleanly (SIGINT, so the WAV gets flushed) and returns the left channel.
-    pub fn stop_and_read(mut self) -> Vec<f32> {
+    pub fn stop_and_read(self) -> Vec<f32> {
+        self.stop_and_read_stereo().0
+    }
+
+    /// Like [`Self::stop_and_read`], but returns both channels.
+    pub fn stop_and_read_stereo(mut self) -> (Vec<f32>, Vec<f32>) {
         let status = Command::new("kill")
             .args(["-INT", &self.child.id().to_string()])
             .status()
@@ -91,7 +106,9 @@ impl Recorder {
         self.child.wait().expect("pw-record exits");
         let bytes = std::fs::read(&self.wav).expect("pw-record wrote a WAV file");
         let _ = std::fs::remove_file(&self.wav);
-        wav_f32_samples(&bytes).step_by(2).collect()
+        let samples: Vec<f32> = wav_f32_samples(&bytes).collect();
+        let channel = |offset| samples.iter().skip(offset).step_by(2).copied().collect();
+        (channel(0), channel(1))
     }
 }
 
@@ -101,6 +118,79 @@ impl Drop for Recorder {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Waits for the recording app whose process binary is `binary` to show up with two ports.
+pub fn wait_for_app(events: &mpsc::Receiver<Event>, binary: &str) -> RecordingApp {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(Event::RecordingApps(apps)) => {
+                let found = apps.into_iter().find(|app| {
+                    app.process_binary.as_deref() == Some(binary) && app.ports.len() == 2
+                });
+                if let Some(app) = found {
+                    return app;
+                }
+            }
+            Ok(Event::Microphone(_)) => {}
+            Ok(Event::Error(message)) => panic!("PipeWire error: {message}"),
+            Err(_) => panic!("{binary} did not show up as a recording app"),
+        }
+    }
+}
+
+/// The registry properties of the node named `name` as `pw-cli ls Node` prints them, or `None`
+/// if there is no such node.
+pub fn node_listing(name: &str) -> Option<String> {
+    let output = Command::new("pw-cli")
+        .args(["ls", "Node"])
+        .output()
+        .expect("pw-cli is installed");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let wanted = format!("node.name = \"{name}\"");
+    listing
+        .split("\tid ")
+        .find(|block| block.lines().any(|line| line.trim() == wanted))
+        .map(|block| format!("id {block}"))
+}
+
+/// The global id of the node named `name`, waiting for it to appear.
+pub fn wait_for_node(name: &str) -> u32 {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(block) = node_listing(name) {
+            let id = block
+                .strip_prefix("id ")
+                .and_then(|rest| rest.split(',').next())
+                .and_then(|id| id.trim().parse().ok());
+            return id.expect("pw-cli prints `id N, type …`");
+        }
+        assert!(Instant::now() < deadline, "node {name} did not appear");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits until there is no node named `name`.
+pub fn wait_for_node_gone(name: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while node_listing(name).is_some() {
+        assert!(Instant::now() < deadline, "node {name} is still there");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The ports of all nodes in one direction as `node:port`, from `pw-link -i` / `pw-link -o`.
+pub fn port_names(direction_flag: &str) -> Vec<String> {
+    let output = Command::new("pw-link")
+        .arg(direction_flag)
+        .output()
+        .expect("pw-link is installed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .collect()
 }
 
 /// Polls `pw-link` until the links from `node`'s output ports satisfy `done`; returns them as
@@ -122,7 +212,7 @@ pub fn wait_for_links(
 
 /// The links from `node`'s output ports according to `pw-link -l`, which prints each output port
 /// followed by its links as `  |-> node:port` lines.
-fn links_from(node: &str) -> Vec<(String, String)> {
+pub fn links_from(node: &str) -> Vec<(String, String)> {
     let output = Command::new("pw-link")
         .arg("-l")
         .output()
@@ -178,6 +268,20 @@ pub fn loud_part(samples: &[f32]) -> &[f32] {
 
 pub fn peak(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0, |peak, s| peak.max(s.abs()))
+}
+
+/// The amplitude of the `frequency` Hz component of `samples` (Goertzel algorithm).
+pub fn tone_amplitude(samples: &[f32], frequency: f32) -> f32 {
+    let omega = 2.0 * std::f32::consts::PI * frequency / SAMPLE_RATE as f32;
+    let coefficient = 2.0 * omega.cos();
+    let (mut previous, mut before) = (0.0_f32, 0.0_f32);
+    for &sample in samples {
+        let current = sample + coefficient * previous - before;
+        before = previous;
+        previous = current;
+    }
+    let power = previous * previous + before * before - coefficient * previous * before;
+    2.0 * power.max(0.0).sqrt() / samples.len().max(1) as f32
 }
 
 pub fn dominant_frequency(samples: &[f32]) -> f32 {

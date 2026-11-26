@@ -1,5 +1,5 @@
 //! SoundBoars' output streams: `soundboars-inject`, which is never autoconnected (the session links
-//! it to the chosen app's recording stream), and `soundboars-local`, which the session manager
+//! it to the chosen app's recording stream or to the virtual microphone), and `soundboars-local`, which the session manager
 //! connects to the default sink.
 
 use std::io::Cursor;
@@ -28,7 +28,7 @@ pub struct StreamConfig {
     pub autoconnect: bool,
 }
 
-/// Plays into the chosen app; [`super::PipeWireService`] links it.
+/// Plays into the call; [`super::PipeWireService`] links it.
 pub const INJECT: StreamConfig = StreamConfig {
     node_name: INJECT_NODE_NAME,
     description: "SoundBoars (voice chat)",

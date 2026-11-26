@@ -13,6 +13,7 @@ pub mod mixer;
 mod output;
 mod service;
 pub mod sine;
+mod virtual_mic;
 pub mod waveform;
 
 pub use controller::{Destination, EngineEvent, PlayRequest, Playing, Trim};
@@ -22,6 +23,7 @@ pub use graph::{Port, RecordingApp};
 pub use mixer::{Retrigger, VoiceId};
 pub use output::{INJECT_NODE_NAME, LOCAL_NODE_NAME, Render};
 pub use service::{Event, PipeWireService, Renders};
+pub use virtual_mic::{VIRTUAL_MIC_DESCRIPTION, VIRTUAL_MIC_NODE_NAME};
 pub use waveform::{Peak, Waveform};
 
 #[derive(Debug, thiserror::Error)]

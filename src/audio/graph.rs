@@ -1,10 +1,17 @@
-//! A model of the parts of the PipeWire graph SoundBoars cares about: apps that record audio, and
-//! the ports of nodes. Fed from registry and node-info events; pure and free of PipeWire types.
+//! A model of the parts of the PipeWire graph SoundBoars cares about: apps that record audio,
+//! microphones (sources), the ports of nodes and the links between them. Fed from registry,
+//! node-info and metadata events; pure and free of PipeWire types.
 
 use std::collections::BTreeMap;
 
+use serde::Deserialize;
+
 /// `media.class` of a stream that records audio, i.e. an app listening to a microphone.
 pub const RECORDING_STREAM_CLASS: &str = "Stream/Input/Audio";
+/// `media.class`es of sources a microphone can be mixed in from.
+pub const SOURCE_CLASSES: [&str; 2] = ["Audio/Source", "Audio/Source/Virtual"];
+/// The key of the `default` metadata (subject 0) that names the default source.
+pub const DEFAULT_SOURCE_KEY: &str = "default.audio.source";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -40,6 +47,18 @@ pub struct RecordingApp {
     pub ports: Vec<Port>,
 }
 
+/// A node that captures audio, e.g. a microphone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub node_id: u32,
+    /// `node.name`, what the `default` metadata names.
+    pub name: String,
+    /// What to show the user: `node.description`, else `node.nick`, else `node.name`.
+    pub description: String,
+    /// `priority.session`; the session manager prefers higher ones as default.
+    pub priority: i64,
+}
+
 /// The properties of a node that SoundBoars uses, parsed from its full (node-info) properties.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeProps {
@@ -47,6 +66,9 @@ pub struct NodeProps {
     pub app_name: String,
     pub process_binary: Option<String>,
     pub media_name: Option<String>,
+    pub node_name: String,
+    pub description: Option<String>,
+    pub priority: i64,
 }
 
 impl NodeProps {
@@ -60,7 +82,16 @@ impl NodeProps {
                 .unwrap_or_default(),
             process_binary: owned("application.process.binary"),
             media_name: owned("media.name"),
+            node_name: owned("node.name").unwrap_or_default(),
+            description: owned("node.description").or_else(|| owned("node.nick")),
+            priority: get("priority.session")
+                .and_then(|priority| priority.parse().ok())
+                .unwrap_or_default(),
         }
+    }
+
+    pub fn is_source(&self) -> bool {
+        SOURCE_CLASSES.contains(&self.media_class.as_str())
     }
 }
 
@@ -86,10 +117,39 @@ impl PortProps {
     }
 }
 
+/// The nodes a link connects, parsed from a link's registry properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkProps {
+    pub output_node: u32,
+    pub input_node: u32,
+}
+
+impl LinkProps {
+    /// Parses link properties; `None` if a node id is missing.
+    pub fn parse<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Self> {
+        Some(Self {
+            output_node: get("link.output.node")?.parse().ok()?,
+            input_node: get("link.input.node")?.parse().ok()?,
+        })
+    }
+}
+
+/// The node name in a `default` metadata value such as `{"name":"alsa_input.usb-mic"}`.
+pub fn parse_default_node(json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct DefaultNode {
+        name: String,
+    }
+    serde_json::from_str::<DefaultNode>(json)
+        .ok()
+        .map(|node| node.name)
+}
+
 #[derive(Debug, Default)]
 pub struct Graph {
     nodes: BTreeMap<u32, NodeProps>,
     ports: BTreeMap<u32, PortProps>,
+    links: BTreeMap<u32, LinkProps>,
 }
 
 impl Graph {
@@ -102,10 +162,39 @@ impl Graph {
         self.ports.insert(props.port.id, props);
     }
 
-    /// Removes the node or port with this global id; unknown ids are ignored.
+    pub fn add_link(&mut self, id: u32, props: LinkProps) {
+        self.links.insert(id, props);
+    }
+
+    /// Removes the node, port or link with this global id; unknown ids are ignored.
     pub fn remove(&mut self, id: u32) {
         self.nodes.remove(&id);
         self.ports.remove(&id);
+        self.links.remove(&id);
+    }
+
+    /// Whether some other node takes audio from `node_id`, e.g. an app records it.
+    pub fn has_consumers(&self, node_id: u32) -> bool {
+        self.links
+            .values()
+            .any(|link| link.output_node == node_id && link.input_node != node_id)
+    }
+
+    /// All known sources (microphones and virtual sources), ordered by node id.
+    pub fn sources(&self) -> Vec<Source> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.is_source())
+            .map(|(&node_id, node)| Source {
+                node_id,
+                name: node.node_name.clone(),
+                description: node
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| node.node_name.clone()),
+                priority: node.priority,
+            })
+            .collect()
     }
 
     /// The ports of `node_id` in `direction`, ordered by port id.
@@ -172,6 +261,9 @@ mod tests {
                 app_name: "WEBRTC VoiceEngine".to_owned(),
                 process_binary: Some("Discord".to_owned()),
                 media_name: Some("recStream".to_owned()),
+                node_name: String::new(),
+                description: None,
+                priority: 0,
             }
         );
     }
@@ -263,5 +355,108 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, [10, 11]);
+    }
+
+    fn source(name: &str, description: Option<&str>, priority: &str) -> NodeProps {
+        let mut props = vec![
+            ("media.class", "Audio/Source"),
+            ("node.name", name),
+            ("priority.session", priority),
+        ];
+        props.extend(description.map(|description| ("node.description", description)));
+        NodeProps::parse(lookup(&props))
+    }
+
+    #[test]
+    fn lists_sources_with_description_and_priority() {
+        let mut graph = Graph::default();
+        graph.set_node(5, source("alsa_input.usb", Some("USB Mic"), "2000"));
+        graph.set_node(6, source("bare", None, "oops"));
+        graph.set_node(
+            7,
+            NodeProps::parse(lookup(&[("media.class", "Audio/Sink")])),
+        );
+        let mut virtual_source = source("virt", None, "1");
+        virtual_source.media_class = "Audio/Source/Virtual".to_owned();
+        graph.set_node(8, virtual_source);
+
+        let sources = graph.sources();
+
+        assert_eq!(
+            sources,
+            [
+                Source {
+                    node_id: 5,
+                    name: "alsa_input.usb".to_owned(),
+                    description: "USB Mic".to_owned(),
+                    priority: 2000,
+                },
+                Source {
+                    node_id: 6,
+                    name: "bare".to_owned(),
+                    description: "bare".to_owned(),
+                    priority: 0,
+                },
+                Source {
+                    node_id: 8,
+                    name: "virt".to_owned(),
+                    description: "virt".to_owned(),
+                    priority: 1,
+                },
+            ]
+        );
+        assert!(graph.recording_apps().is_empty());
+    }
+
+    #[test]
+    fn description_falls_back_to_nick() {
+        let props = NodeProps::parse(lookup(&[("node.nick", "Nick")]));
+        assert_eq!(props.description.as_deref(), Some("Nick"));
+    }
+
+    #[test]
+    fn consumers_are_links_out_of_a_node_into_another() {
+        let mut graph = Graph::default();
+        let link = |output_node, input_node| LinkProps {
+            output_node,
+            input_node,
+        };
+        graph.add_link(100, link(1, 2));
+        graph.add_link(101, link(3, 3));
+
+        assert!(graph.has_consumers(1));
+        assert!(!graph.has_consumers(2));
+        assert!(!graph.has_consumers(3));
+
+        graph.remove(100);
+        assert!(!graph.has_consumers(1));
+    }
+
+    #[test]
+    fn parses_link_props() {
+        assert_eq!(
+            LinkProps::parse(lookup(&[
+                ("link.output.node", "50"),
+                ("link.input.node", "47")
+            ])),
+            Some(LinkProps {
+                output_node: 50,
+                input_node: 47
+            })
+        );
+        assert_eq!(
+            LinkProps::parse(lookup(&[("link.output.node", "50")])),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_the_default_node_name() {
+        assert_eq!(
+            parse_default_node(r#"{"name":"alsa_input.usb"}"#).as_deref(),
+            Some("alsa_input.usb")
+        );
+        assert_eq!(parse_default_node("{}"), None);
+        assert_eq!(parse_default_node("not json"), None);
     }
 }

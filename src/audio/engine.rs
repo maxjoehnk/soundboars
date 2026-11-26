@@ -16,7 +16,8 @@ use super::service::{PipeWireService, Renders};
 /// How often the control thread collects finished voices while sounds play.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Plays sounds into the linked app (`soundboars-inject`) and, if enabled, on the default sink
+/// Plays sounds into the call (`soundboars-inject`, linked into an app or the virtual microphone)
+/// and, if enabled, on the default sink
 /// (`soundboars-local`). Every call returns right away; results arrive as [`EngineEvent`]s.
 /// Dropping the engine stops playback, unlinks and disconnects from PipeWire.
 pub struct AudioEngine {
@@ -95,7 +96,7 @@ impl AudioEngine {
         self.send(Message::Preload(paths));
     }
 
-    /// Volume of what the linked app receives, `0.0..=1.0`.
+    /// Volume of what the call receives, `0.0..=1.0`.
     pub fn set_call_volume(&self, volume: f32) {
         self.send(Message::SetCallVolume(volume));
     }
@@ -126,6 +127,14 @@ impl AudioEngine {
     pub fn link_to(&self, node_id: u32) {
         self.pipewire.link_to(node_id);
         self.send(Message::SetTarget(Some(node_id)));
+    }
+
+    /// Sends sounds and the user's microphone through the virtual microphone "SoundBoars
+    /// Microphone" (see [`EngineEvent::Microphone`]), replacing any previous target.
+    pub fn use_virtual_mic(&self) {
+        self.pipewire.use_virtual_mic();
+        // Consumers of the virtual microphone downmix by averaging, so no compensation is needed.
+        self.send(Message::SetTarget(None));
     }
 
     pub fn unlink(&self) {

@@ -2,8 +2,9 @@
 
 use eframe::egui;
 
-use crate::app::targets::{NO_APPS_HINT, label};
+use crate::app::targets::{NO_APPS_HINT, VIRTUAL_MIC_HINT, VIRTUAL_MIC_LABEL, label};
 use crate::app::{Action, AppState};
+use crate::config::Injection;
 
 pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
     egui::Panel::top("top").show(ui, |ui| {
@@ -42,20 +43,35 @@ fn url_import_button(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Acti
     }
 }
 
+/// "Inject into:" the virtual microphone, an app, or nothing.
 fn target_picker(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    let virtual_mic = state.config.injection == Injection::VirtualMic;
     let saved = state.config.target.as_ref();
     let selected = state.targets.linked_app().map(|app| app.node_id);
     let caption = ui.label("Inject into:");
     ui.add_enabled_ui(state.audio_available, |ui| {
+        let selected_text = if virtual_mic {
+            VIRTUAL_MIC_LABEL.to_owned()
+        } else {
+            state.targets.selected_label(saved)
+        };
         let combo = egui::ComboBox::from_id_salt("target")
             .width(260.0)
-            .selected_text(state.targets.selected_label(saved))
+            .selected_text(selected_text)
             .show_ui(ui, |ui| {
-                if ui.selectable_label(selected.is_none(), "None").clicked() {
+                if ui
+                    .selectable_label(virtual_mic, VIRTUAL_MIC_LABEL)
+                    .on_hover_text(VIRTUAL_MIC_HINT)
+                    .clicked()
+                {
+                    actions.push(Action::SelectVirtualMic);
+                }
+                let no_app = !virtual_mic && selected.is_none();
+                if ui.selectable_label(no_app, "None").clicked() {
                     actions.push(Action::SelectTarget(None));
                 }
                 for app in state.targets.apps() {
-                    let is_selected = selected == Some(app.node_id);
+                    let is_selected = !virtual_mic && selected == Some(app.node_id);
                     if ui.selectable_label(is_selected, label(app)).clicked() {
                         actions.push(Action::SelectTarget(Some(app.node_id)));
                     }
@@ -64,11 +80,15 @@ fn target_picker(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>)
                     ui.weak(NO_APPS_HINT);
                 }
             });
-        combo
-            .response
-            .labelled_by(caption.id)
-            .on_hover_text(NO_APPS_HINT);
-        if ui
+        let hint = if virtual_mic {
+            VIRTUAL_MIC_HINT
+        } else {
+            NO_APPS_HINT
+        };
+        combo.response.labelled_by(caption.id).on_hover_text(hint);
+        if virtual_mic {
+            microphone_hint(ui, state);
+        } else if ui
             .button("⟳")
             .on_hover_text("Link to the remembered app again")
             .clicked()
@@ -76,6 +96,18 @@ fn target_picker(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>)
             actions.push(Action::RefreshTargets);
         }
     });
+}
+
+/// Which real microphone the virtual microphone carries besides the sounds.
+fn microphone_hint(ui: &mut egui::Ui, state: &AppState) {
+    let text = match state.targets.microphone() {
+        Some(microphone) => format!("with {microphone}"),
+        None => "no microphone found".to_owned(),
+    };
+    ui.weak(text).on_hover_text(format!(
+        "{VIRTUAL_MIC_HINT}\nIt carries the sounds and your default microphone while an app \
+         records it."
+    ));
 }
 
 fn tabs(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {

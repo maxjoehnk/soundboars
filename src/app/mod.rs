@@ -21,7 +21,7 @@ use eframe::egui;
 
 use crate::audio::decode::probe_duration;
 use crate::audio::{EngineEvent, Retrigger, Waveform};
-use crate::config::{ConfigStore, SavedTarget, Settings, TabConfig, Theme};
+use crate::config::{ConfigStore, Injection, SavedTarget, Settings, TabConfig, Theme};
 use crate::hotkeys::{BackendKind, Hotkey};
 use crate::import::{DownloadEvent, Downloader};
 use crate::library::durations::DurationProbe;
@@ -35,7 +35,7 @@ pub use services::{
 };
 pub use sound_editor::{EditorAction, SoundEditor, WaveformState};
 pub use state::{AppState, format_duration};
-pub use targets::{NO_APPS_HINT, Targets};
+pub use targets::{NO_APPS_HINT, Targets, VIRTUAL_MIC_HINT, VIRTUAL_MIC_LABEL};
 use triggers::{Dispatcher, Trigger};
 use ui::{Dialog, View};
 pub use url_import::{ImportStatus, UrlImport, UrlImportAction};
@@ -58,8 +58,10 @@ pub enum Action {
     StopAll,
     SelectTab(usize),
     Search(String),
-    /// Link to this recording node, or unlink with `None`.
+    /// Link to this recording node, or unlink with `None` (both [`Injection::App`]).
     SelectTarget(Option<u32>),
+    /// Inject through the virtual microphone ([`Injection::VirtualMic`]).
+    SelectVirtualMic,
     /// Retry linking to the remembered target.
     RefreshTargets,
     AddFolder,
@@ -199,6 +201,7 @@ impl App {
         app.watch_tabs();
         app.library_changed();
         app.apply_settings();
+        app.start_injection();
         app.sync_hotkeys();
         app.select_midi_input();
         app.sync_triggers();
@@ -260,6 +263,7 @@ impl App {
             Action::SelectTab(tab) => self.state.select_tab(tab),
             Action::Search(query) => self.state.search = query,
             Action::SelectTarget(node_id) => self.select_target(node_id),
+            Action::SelectVirtualMic => self.select_virtual_mic(),
             Action::RefreshTargets => self.relink(),
             Action::AddFolder => self
                 .folder_picker
@@ -331,6 +335,7 @@ impl App {
                 self.state.targets.set_apps(apps);
                 self.relink();
             }
+            EngineEvent::Microphone(microphone) => self.state.targets.set_microphone(microphone),
             EngineEvent::Error(message) => self.show_error(message),
             EngineEvent::DecodeFailed { path, error } => {
                 self.show_error(format!("Could not play {}: {error}", path.display()));
@@ -534,7 +539,24 @@ impl App {
         }
     }
 
+    /// Sets up the saved injection mode; app targets are linked once their app shows up
+    /// ([`Self::relink`]).
+    fn start_injection(&mut self) {
+        if self.state.config.injection == Injection::VirtualMic {
+            self.with_audio(|audio| audio.use_virtual_mic());
+        }
+    }
+
+    /// Switches to the virtual microphone; the remembered app target stays for switching back.
+    fn select_virtual_mic(&mut self) {
+        self.state.config.injection = Injection::VirtualMic;
+        self.state.targets.set_linked(None);
+        self.with_audio(|audio| audio.use_virtual_mic());
+        self.unsaved = true;
+    }
+
     fn select_target(&mut self, node_id: Option<u32>) {
+        self.state.config.injection = Injection::App;
         let app = node_id.and_then(|id| {
             self.state
                 .targets
@@ -553,8 +575,12 @@ impl App {
         self.unsaved = true;
     }
 
-    /// Links to the remembered target if it runs and we aren't linked to it already.
+    /// Links to the remembered target if it runs and we aren't linked to it already (only with
+    /// [`Injection::App`]).
     fn relink(&mut self) {
+        if self.state.config.injection != Injection::App {
+            return;
+        }
         if let Some(node_id) = self.state.targets.relink(self.state.config.target.as_ref()) {
             tracing::info!("linking to the remembered target (node {node_id})");
             self.link_to(node_id);

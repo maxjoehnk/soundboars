@@ -5,11 +5,13 @@
 mod common;
 
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{FAKE_BINARY, Recorder, TIMEOUT, assert_tone, same_channel, temp_wav, wait_for_links};
+use common::{
+    FAKE_BINARY, Recorder, assert_tone, same_channel, temp_wav, wait_for_app, wait_for_links,
+};
 use soundboars::audio::sine::Sine;
-use soundboars::audio::{Event, INJECT_NODE_NAME, PipeWireService, RecordingApp, Renders};
+use soundboars::audio::{INJECT_NODE_NAME, PipeWireService, Renders};
 
 #[test]
 fn injects_a_sine_into_a_recording_app_and_unlinks_again() {
@@ -53,23 +55,4 @@ fn injects_a_sine_into_a_recording_app_and_unlinks_again() {
     drop(service);
     wait_for_links(INJECT_NODE_NAME, |links| links.is_empty());
     recorder.stop_and_read();
-}
-
-fn wait_for_app(events: &mpsc::Receiver<Event>, binary: &str) -> RecordingApp {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match events.recv_timeout(remaining) {
-            Ok(Event::RecordingApps(apps)) => {
-                let found = apps.into_iter().find(|app| {
-                    app.process_binary.as_deref() == Some(binary) && app.ports.len() == 2
-                });
-                if let Some(app) = found {
-                    return app;
-                }
-            }
-            Ok(Event::Error(message)) => panic!("PipeWire error: {message}"),
-            Err(_) => panic!("{binary} did not show up as a recording app"),
-        }
-    }
 }

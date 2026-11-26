@@ -22,6 +22,7 @@ pub trait AudioBackend: Send {
     fn set_retrigger_policy(&self, retrigger: Retrigger);
     fn invalidate(&self, path: &Path);
     fn link_to(&self, node_id: u32);
+    fn use_virtual_mic(&self);
     fn unlink(&self);
     /// The events since the last call.
     fn poll_events(&self) -> Vec<EngineEvent>;
@@ -89,6 +90,10 @@ impl AudioBackend for AudioEngine {
 
     fn link_to(&self, node_id: u32) {
         AudioEngine::link_to(self, node_id);
+    }
+
+    fn use_virtual_mic(&self) {
+        AudioEngine::use_virtual_mic(self);
     }
 
     fn unlink(&self) {

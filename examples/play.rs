@@ -135,7 +135,9 @@ fn wait_until_finished(engine: &AudioEngine) -> anyhow::Result<()> {
                 bail!("could not decode {}: {error}", path.display())
             }
             EngineEvent::Error(message) => println!("Error: {message}"),
-            EngineEvent::RecordingApps(_) | EngineEvent::Waveform { .. } => {}
+            EngineEvent::RecordingApps(_)
+            | EngineEvent::Microphone(_)
+            | EngineEvent::Waveform { .. } => {}
         }
     }
     bail!("the audio engine stopped")

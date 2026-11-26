@@ -1,5 +1,5 @@
-//! The apps sounds can be injected into, which one we're linked to, and when to relink to the
-//! remembered one.
+//! The apps sounds can be injected into, which one we're linked to, when to relink to the
+//! remembered one, and which microphone the virtual microphone mixes in.
 
 use crate::audio::RecordingApp;
 use crate::config::SavedTarget;
@@ -7,12 +7,19 @@ use crate::config::SavedTarget;
 /// Shown when no app records audio.
 pub const NO_APPS_HINT: &str =
     "Apps only appear while they record audio, e.g. while in a Discord call.";
+/// The target picker's entry for the virtual microphone.
+pub const VIRTUAL_MIC_LABEL: &str = "🎤 SoundBoars Microphone";
+/// How to use the virtual microphone.
+pub const VIRTUAL_MIC_HINT: &str =
+    "Select “SoundBoars Microphone” as the input device in your call app.";
 
 #[derive(Debug, Default)]
 pub struct Targets {
     apps: Vec<RecordingApp>,
     /// The node we last linked to; it may have disappeared since.
     linked: Option<u32>,
+    /// The description of the microphone the virtual microphone mixes in.
+    microphone: Option<String>,
 }
 
 impl Targets {
@@ -22,6 +29,14 @@ impl Targets {
 
     pub fn set_apps(&mut self, apps: Vec<RecordingApp>) {
         self.apps = apps;
+    }
+
+    pub fn microphone(&self) -> Option<&str> {
+        self.microphone.as_deref()
+    }
+
+    pub fn set_microphone(&mut self, microphone: Option<String>) {
+        self.microphone = microphone;
     }
 
     pub fn set_linked(&mut self, node_id: Option<u32>) {

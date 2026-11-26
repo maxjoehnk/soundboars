@@ -20,8 +20,11 @@ pub const CONFIG_PATH_ENV: &str = "SOUNDBOARS_CONFIG";
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// How sounds get into the call.
+    pub injection: Injection,
     pub settings: Settings,
-    /// The app sounds are injected into; relinked whenever it (re)appears.
+    /// The app sounds are injected into with [`Injection::App`]; relinked whenever it
+    /// (re)appears.
     pub target: Option<SavedTarget>,
     /// In display order.
     pub tabs: Vec<TabConfig>,
@@ -67,6 +70,18 @@ pub enum Theme {
     #[default]
     Dark,
     Light,
+}
+
+/// How sounds get into the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Injection {
+    /// Through the virtual microphone "SoundBoars Microphone", which also carries the user's real
+    /// microphone; call apps use it as their input device.
+    #[default]
+    VirtualMic,
+    /// Straight into the recording stream of [`Config::target`].
+    App,
 }
 
 /// Identifies a recording app across restarts (its PipeWire node id changes every time).
@@ -340,6 +355,7 @@ mod tests {
             },
         );
         Config {
+            injection: Injection::App,
             settings: Settings {
                 call_volume: 0.8,
                 local_volume: 0.25,
@@ -396,6 +412,33 @@ mod tests {
         assert!(text.contains("hotkey = \"Ctrl+Shift+F13\""), "{text}");
         assert!(text.contains("shortcut_id = \"play-airhorn\""), "{text}");
         assert!(text.contains("note = 36"), "{text}");
+        assert!(text.contains("injection = \"app\""), "{text}");
+    }
+
+    #[test]
+    fn injection_defaults_to_the_virtual_mic_and_keeps_the_target() {
+        let (_dir, store) = store();
+        fs::create_dir_all(store.path().parent().expect("parent")).expect("mkdir");
+        let text = r#"
+            [target]
+            process_binary = "Discord"
+            app_name = "WEBRTC VoiceEngine"
+        "#;
+        fs::write(store.path(), text).expect("write");
+
+        let (config, error) = store.load();
+
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(config.injection, Injection::VirtualMic);
+        assert_eq!(
+            config.target.map(|target| target.app_name).as_deref(),
+            Some("WEBRTC VoiceEngine")
+        );
+        let virtual_mic = Config::default();
+        store.save(&virtual_mic).expect("save");
+        let text = fs::read_to_string(store.path()).expect("read");
+        assert!(text.contains("injection = \"virtual-mic\""), "{text}");
+        assert_eq!(store.load().0, virtual_mic);
     }
 
     #[test]
