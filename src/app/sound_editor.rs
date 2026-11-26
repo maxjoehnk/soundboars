@@ -1,13 +1,15 @@
-//! The "Edit sound" window's state and logic: the shown name, per-sound volume, the
-//! non-destructive trim and the global hotkey, edited on a copy that [`SoundEditor::apply_to`] writes into the sound's [`SoundConfig`] on save.
+//! The "Edit sound" window's state and logic: the shown name, per-clip volume, the
+//! non-destructive trim and the global hotkey of one clip, edited on a copy that
+//! [`SoundEditor::apply_to`] writes into the clip's [`SoundConfig`] on save.
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::audio::{Destination, PlayRequest, Playing, Trim, Waveform};
 use crate::config::SoundConfig;
 use crate::hotkeys::Hotkey;
 use crate::midi::MidiBinding;
+
+use super::clips::{self, ClipId};
 
 /// The shortest trimmed sound the handles allow.
 pub const MIN_LENGTH_MS: u64 = 50;
@@ -65,7 +67,8 @@ pub enum WaveformState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SoundEditor {
-    pub path: PathBuf,
+    /// The edited clip of the sound file.
+    pub clip: ClipId,
     /// The file name, shown read-only.
     pub file_name: String,
     /// The name shown on the tile, as edited (see [`Self::saved_name`]).
@@ -92,15 +95,17 @@ pub struct SoundEditor {
 }
 
 impl SoundEditor {
-    /// Edits the sound at `path`, starting from its saved metadata. The waveform is loading.
-    pub fn open(path: &Path, saved: &SoundConfig) -> Self {
+    /// Edits `clip`, starting from its saved metadata. The waveform is loading.
+    pub fn open(clip: &ClipId, saved: &SoundConfig) -> Self {
+        let path = &clip.path;
         let file_name = path.file_name().map_or_else(
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let name = saved.name.clone().unwrap_or_else(|| file_stem(path));
+        let name = (saved.name.clone())
+            .unwrap_or_else(|| clips::default_name(&clips::file_stem(path), clip.clip));
         Self {
-            path: path.to_owned(),
+            clip: clip.clone(),
             file_name,
             name,
             focus_name: false,
@@ -197,7 +202,8 @@ impl SoundEditor {
     pub fn preview_request(&mut self) -> PlayRequest {
         self.preview_start_ms = self.start_ms;
         PlayRequest {
-            path: self.path.clone(),
+            path: self.clip.path.clone(),
+            clip: self.clip.clip,
             trim: self.trim(),
             volume: self.volume,
             destination: Destination::Preview,
@@ -224,15 +230,15 @@ impl SoundEditor {
         Some(binding)
     }
 
-    /// The name to save: `None` (show the file name) when it's blank or just the file name.
+    /// The name to save: `None` (show the default name) when it's blank or just the default.
     pub fn saved_name(&self) -> Option<String> {
         let name = self.name.trim();
-        (!name.is_empty() && name != self.file_stem()).then(|| name.to_owned())
+        (!name.is_empty() && name != self.default_name()).then(|| name.to_owned())
     }
 
-    /// The file name without extension: what the tile shows without a name of its own.
-    pub fn file_stem(&self) -> String {
-        file_stem(&self.path)
+    /// What the tile shows without a name of its own (see [`clips::default_name`]).
+    pub fn default_name(&self) -> String {
+        clips::default_name(&clips::file_stem(&self.clip.path), self.clip.clip)
     }
 
     /// Writes the name, volume, trim, MIDI binding and hotkey into `config`: a trim to the end of
@@ -312,13 +318,6 @@ pub fn x_of(ms: u64, left: f32, width: f32, duration_ms: u64) -> f32 {
     left + width * (ms.min(duration_ms) as f64 / duration_ms as f64) as f32
 }
 
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
-}
-
 pub fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -344,7 +343,7 @@ mod tests {
             end_ms,
             ..SoundConfig::default()
         };
-        let mut editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
+        let mut editor = SoundEditor::open(&ClipId::file("/sounds/Air horn.mp3"), &saved);
         editor.waveform_loaded(Ok(waveform()));
         editor
     }
@@ -367,7 +366,7 @@ mod tests {
             end_ms: None,
             ..SoundConfig::default()
         };
-        let editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
+        let editor = SoundEditor::open(&ClipId::file("/sounds/Air horn.mp3"), &saved);
         assert_eq!(editor.file_name, "Air horn.mp3");
         assert_eq!(editor.name, "Air horn");
         assert_eq!(editor.volume, 0.5);
@@ -383,7 +382,7 @@ mod tests {
         editor.apply(EditorAction::Name("  Horn of doom ".to_owned()));
         assert_eq!(saved(&editor).name.as_deref(), Some("Horn of doom"));
 
-        let reopened = SoundEditor::open(&editor.path, &saved(&editor));
+        let reopened = SoundEditor::open(&editor.clip, &saved(&editor));
         assert_eq!(reopened.name, "Horn of doom");
         assert_eq!(reopened.file_name, "Air horn.mp3");
 
@@ -391,6 +390,18 @@ mod tests {
         assert_eq!(saved(&editor).name, None, "the file name");
         editor.apply(EditorAction::Name("   ".to_owned()));
         assert_eq!(saved(&editor).name, None, "blank");
+    }
+
+    #[test]
+    fn more_clips_are_edited_with_their_numbered_default_name() {
+        let clip = ClipId::new("/sounds/Air horn.mp3", 1);
+        let mut editor = SoundEditor::open(&clip, &SoundConfig::default());
+        assert_eq!(editor.name, "Air horn (2)");
+        assert_eq!(editor.file_name, "Air horn.mp3");
+        assert_eq!(saved(&editor).name, None);
+        editor.apply(EditorAction::Name("Air horn".to_owned()));
+        assert_eq!(saved(&editor).name.as_deref(), Some("Air horn"));
+        assert_eq!(editor.preview_request().clip, 1);
     }
 
     #[test]
@@ -410,7 +421,7 @@ mod tests {
 
     #[test]
     fn a_failed_waveform_keeps_the_trim() {
-        let mut editor = SoundEditor::open(Path::new("a.wav"), &SoundConfig::default());
+        let mut editor = SoundEditor::open(&ClipId::file("a.wav"), &SoundConfig::default());
         editor.waveform_loaded(Err("broken".to_owned()));
         assert_eq!(editor.waveform, WaveformState::Failed("broken".to_owned()));
         assert_eq!(trim(&editor), (0, None));
@@ -512,10 +523,10 @@ mod tests {
         editor.apply(EditorAction::MidiAnyDevice(false));
         assert_eq!(saved(&editor).midi, Some(learned));
 
-        let reopened = SoundEditor::open(&editor.path, &saved(&editor));
+        let reopened = SoundEditor::open(&editor.clip, &saved(&editor));
         assert!(!reopened.midi_any_device);
         let mut reopened = SoundEditor::open(
-            &editor.path,
+            &editor.clip,
             &SoundConfig {
                 midi: Some(any_port),
                 ..SoundConfig::default()
@@ -554,7 +565,8 @@ mod tests {
         let started_at = Instant::now();
         let preview = Playing {
             voice: 1,
-            path: editor.path.clone(),
+            path: editor.clip.path.clone(),
+            clip: 0,
             started_at,
             duration: Duration::from_millis(900),
             destination: Destination::Preview,
@@ -591,7 +603,7 @@ mod tests {
             shortcut_id: Some("play-air-horn".to_owned()),
             ..SoundConfig::default()
         };
-        let mut editor = SoundEditor::open(Path::new("/sounds/Air horn.mp3"), &saved);
+        let mut editor = SoundEditor::open(&ClipId::file("/sounds/Air horn.mp3"), &saved);
         assert_eq!(editor.hotkey, Some(ctrl_f13));
         assert_eq!(editor.shortcut_id.as_deref(), Some("play-air-horn"));
 

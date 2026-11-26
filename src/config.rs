@@ -167,6 +167,13 @@ pub struct SoundConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shortcut_id: Option<String>,
     pub midi: Option<MidiBinding>,
+    /// More clips of the same file, e.g. other parts of it, each a tile of its own. The fields
+    /// above are the file's own clip (id 0).
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_clips"
+    )]
+    pub clips: Vec<ClipConfig>,
 }
 
 impl Default for SoundConfig {
@@ -179,6 +186,7 @@ impl Default for SoundConfig {
             hotkey: None,
             shortcut_id: None,
             midi: None,
+            clips: Vec::new(),
         }
     }
 }
@@ -200,6 +208,73 @@ impl SoundConfig {
             .min(length);
         end.saturating_sub(Duration::from_millis(self.start_ms))
     }
+
+    /// The file's clips with their ids: its own (0, `self`), then [`Self::clips`] in id order.
+    pub fn with_clips(&self) -> impl Iterator<Item = (u32, &SoundConfig)> {
+        let mut extra: Vec<&ClipConfig> = self.clips.iter().collect();
+        extra.sort_by_key(|clip| clip.id);
+        let extra = extra.into_iter().map(|clip| (clip.id, &clip.config));
+        std::iter::once((0, self)).chain(extra)
+    }
+
+    /// The clip with this id: `self` for 0.
+    pub fn clip(&self, id: u32) -> Option<&SoundConfig> {
+        self.with_clips()
+            .find(|&(clip, _)| clip == id)
+            .map(|(_, config)| config)
+    }
+
+    /// The clip with this id to change: `self` for 0.
+    pub fn clip_mut(&mut self, id: u32) -> Option<&mut SoundConfig> {
+        if id == 0 {
+            return Some(self);
+        }
+        let clip = self.clips.iter_mut().find(|clip| clip.id == id)?;
+        Some(&mut clip.config)
+    }
+
+    /// The id for a new clip: one more than the highest so far.
+    pub fn next_clip_id(&self) -> u32 {
+        self.clips.iter().map(|clip| clip.id).max().unwrap_or(0) + 1
+    }
+}
+
+/// Another clip of a sound's file ([`SoundConfig::clips`]): its own name, trim, volume and
+/// triggers. The file itself is shared, never copied.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipConfig {
+    /// At least 1 (0 is the file's own clip) and unique among the file's clips.
+    pub id: u32,
+    /// Its own [`SoundConfig::clips`] are meaningless and never kept.
+    #[serde(flatten)]
+    pub config: SoundConfig,
+}
+
+/// The extra clips of a sound, without their meaningless nested clips and without clips whose id
+/// is 0 or taken (with a warning, instead of rejecting the file).
+fn deserialize_clips<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ClipConfig>, D::Error> {
+    let mut ids = std::collections::HashSet::new();
+    let clips = Vec::<ClipConfig>::deserialize(deserializer)?;
+    Ok(clips
+        .into_iter()
+        .filter(|clip| {
+            let valid = clip.id > 0 && ids.insert(clip.id);
+            if !valid {
+                tracing::warn!(
+                    "ignoring a clip in the config: its id {} is invalid",
+                    clip.id
+                );
+            }
+            valid
+        })
+        .map(|mut clip| {
+            clip.config.clips.clear();
+            clip
+        })
+        .collect())
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -357,6 +432,23 @@ mod tests {
                     channel: 10,
                     control: MidiControl::Note(36),
                 }),
+                clips: vec![ClipConfig {
+                    id: 2,
+                    config: SoundConfig {
+                        name: Some("Air horn (end)".to_owned()),
+                        volume: 0.75,
+                        start_ms: 1500,
+                        end_ms: None,
+                        hotkey: "Ctrl+F14".parse().ok(),
+                        shortcut_id: Some("play-airhorn-2".to_owned()),
+                        midi: Some(MidiBinding {
+                            port: None,
+                            channel: 10,
+                            control: MidiControl::Note(37),
+                        }),
+                        clips: Vec::new(),
+                    },
+                }],
             },
         );
         Config {
@@ -418,6 +510,92 @@ mod tests {
         assert!(text.contains("shortcut_id = \"play-airhorn\""), "{text}");
         assert!(text.contains("note = 36"), "{text}");
         assert!(text.contains("injection = \"app\""), "{text}");
+        assert!(
+            text.contains("[[tabs.sounds.\"airhorn.mp3\".clips]]"),
+            "{text}"
+        );
+        assert!(text.contains("id = 2"), "{text}");
+        assert!(text.contains("name = \"Air horn (end)\""), "{text}");
+    }
+
+    #[test]
+    fn configs_without_clips_load_and_save_unchanged() {
+        let (_dir, store) = store();
+        let mut config = sample();
+        config.tabs[0]
+            .sounds
+            .get_mut("airhorn.mp3")
+            .expect("in the sample")
+            .clips
+            .clear();
+        store.save(&config).expect("save");
+        let text = fs::read_to_string(store.path()).expect("read");
+        assert!(!text.contains("clips"), "{text}");
+        assert_eq!(store.load().0, config);
+        store.save(&store.load().0).expect("save again");
+        assert_eq!(fs::read_to_string(store.path()).expect("read"), text);
+    }
+
+    #[test]
+    fn invalid_and_nested_clips_are_ignored() {
+        let (_dir, store) = store();
+        fs::create_dir_all(store.path().parent().expect("parent")).expect("mkdir");
+        let text = r#"
+            [[tabs]]
+            path = "/sounds"
+            [[tabs.sounds."a.wav".clips]]
+            id = 1
+            start_ms = 100
+            hotkey = "Ctrl+Nope"
+            [[tabs.sounds."a.wav".clips.clips]]
+            id = 5
+            [[tabs.sounds."a.wav".clips]]
+            id = 1
+            [[tabs.sounds."a.wav".clips]]
+            id = 0
+            [[tabs.sounds."a.wav".clips]]
+            name = "no id"
+        "#;
+        fs::write(store.path(), text).expect("write");
+
+        let (config, error) = store.load();
+
+        assert!(error.is_none(), "{error:?}");
+        let sound = &config.tabs[0].sounds["a.wav"];
+        assert_eq!(
+            sound.clips,
+            [ClipConfig {
+                id: 1,
+                config: SoundConfig {
+                    start_ms: 100,
+                    ..SoundConfig::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn clips_are_found_by_id_and_new_ids_follow_the_highest() {
+        let mut sound = SoundConfig::default();
+        assert_eq!(sound.next_clip_id(), 1);
+        for id in [3, 1] {
+            sound.clips.push(ClipConfig {
+                id,
+                config: SoundConfig {
+                    start_ms: u64::from(id),
+                    ..SoundConfig::default()
+                },
+            });
+        }
+        assert_eq!(sound.next_clip_id(), 4);
+        let ids: Vec<u32> = sound.with_clips().map(|(id, _)| id).collect();
+        assert_eq!(ids, [0, 1, 3], "in id order");
+        assert_eq!(sound.clip(3).map(|clip| clip.start_ms), Some(3));
+        assert_eq!(sound.clip(2), None);
+        sound.clip_mut(1).expect("exists").volume = 0.5;
+        assert_eq!(sound.clips[1].config.volume, 0.5);
+        sound.clip_mut(0).expect("the file's own").volume = 0.25;
+        assert_eq!(sound.volume, 0.25);
     }
 
     #[test]

@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use crate::audio::{Destination, PlayRequest, Playing};
 use crate::config::{Config, SoundConfig};
 use crate::hotkeys::{BackendKind, Capabilities};
-use crate::library::{Library, Sound};
+use crate::library::Library;
 
+use super::clips::{ClipId, default_name, file_stem};
 use super::midi::MidiState;
 use super::sound_editor::SoundEditor;
 use super::targets::Targets;
@@ -74,68 +75,71 @@ impl AppState {
         !self.search.trim().is_empty()
     }
 
-    /// The tiles to show: the search results across all tabs while searching, else the sounds of
-    /// the selected tab.
-    pub fn visible_sounds(&self) -> Vec<&Sound> {
+    /// The tiles to show: the search results across all tabs while searching, else the clips of
+    /// the selected tab's sounds (each file's own clip followed by its more clips).
+    pub fn visible_clips(&self) -> Vec<ClipId> {
         if self.is_searching() {
             return self.search_results();
         }
-        self.library
-            .folders()
-            .get(self.tab)
-            .map(|folder| folder.sounds.iter().collect())
-            .unwrap_or_default()
+        let sounds = self.library.folders().get(self.tab).into_iter();
+        (sounds.flat_map(|folder| &folder.sounds))
+            .flat_map(|sound| self.clips_of(&sound.path))
+            .collect()
     }
 
-    /// Sounds of all tabs whose shown name or file name contains the search, ignoring case.
-    fn search_results(&self) -> Vec<&Sound> {
+    /// Clips of all tabs whose shown name or file name contains the search, ignoring case.
+    fn search_results(&self) -> Vec<ClipId> {
         let query = self.search.trim().to_lowercase();
-        self.library
-            .sounds()
-            .filter(|sound| {
-                self.display_name(sound).to_lowercase().contains(&query)
-                    || sound.name.to_lowercase().contains(&query)
+        (self.library.sounds())
+            .flat_map(|sound| self.clips_of(&sound.path))
+            .filter(|clip| {
+                self.display_name(clip).to_lowercase().contains(&query)
+                    || file_stem(&clip.path).to_lowercase().contains(&query)
             })
             .collect()
     }
 
-    /// The name on the sound's tile: the one given in "Edit sound", else the file name.
-    pub fn display_name(&self, sound: &Sound) -> String {
-        self.sound_config(&sound.path)
+    /// The name on the clip's tile: the one given in "Edit sound", else the file name (numbered
+    /// for more clips of the file, see [`default_name`]).
+    pub fn display_name(&self, clip: &ClipId) -> String {
+        self.sound_config(clip)
             .and_then(|meta| meta.name)
-            .unwrap_or_else(|| sound.name.clone())
+            .unwrap_or_else(|| default_name(&file_stem(&clip.path), clip.clip))
     }
 
-    /// Plays the sound at `path` with its volume and trim from the config.
-    pub fn play_request(&self, path: &Path) -> Option<PlayRequest> {
-        let meta = self.sound_config(path)?;
+    /// Plays the clip with its volume and trim from the config.
+    pub fn play_request(&self, clip: &ClipId) -> Option<PlayRequest> {
+        let meta = self.sound_config(clip)?;
         Some(PlayRequest {
-            path: path.to_owned(),
+            path: clip.path.clone(),
+            clip: clip.clip,
             trim: meta.trim(),
             volume: meta.volume,
             destination: Destination::Everywhere,
         })
     }
 
-    /// The saved metadata of the sound at `path` (defaults if there is none yet).
-    pub fn sound_config(&self, path: &Path) -> Option<SoundConfig> {
-        let (tab, sound) = self.library.find(path)?;
-        let meta = self.config.tabs.get(tab)?.sounds.get(&sound.key);
-        Some(meta.cloned().unwrap_or_default())
+    /// The saved metadata of the clip (defaults for a file's own clip if there is none yet);
+    /// `None` if its file isn't in a tab or there's no such clip.
+    pub fn sound_config(&self, clip: &ClipId) -> Option<SoundConfig> {
+        let (tab, sound) = self.library.find(&clip.path)?;
+        let file = self.config.tabs.get(tab)?.sounds.get(&sound.key);
+        match file {
+            Some(file) => file.clip(clip.clip).cloned(),
+            None => (clip.clip == 0).then(SoundConfig::default),
+        }
     }
 
-    /// The metadata of the sound at `path` to change, created with defaults if missing.
-    pub fn sound_config_mut(&mut self, path: &Path) -> Option<&mut SoundConfig> {
-        let (tab, sound) = self.library.find(path)?;
+    /// The metadata of the clip to change; a file's own clip's is created with defaults if
+    /// missing.
+    pub fn sound_config_mut(&mut self, clip: &ClipId) -> Option<&mut SoundConfig> {
+        let (tab, sound) = self.library.find(&clip.path)?;
         let key = sound.key.clone();
-        Some(
-            self.config
-                .tabs
-                .get_mut(tab)?
-                .sounds
-                .entry(key)
-                .or_default(),
-        )
+        let sounds = &mut self.config.tabs.get_mut(tab)?.sounds;
+        match clip.clip {
+            0 => Some(sounds.entry(key).or_default()),
+            id => sounds.get_mut(&key)?.clip_mut(id),
+        }
     }
 
     /// The board's sounds that play right now, without previews.
@@ -152,10 +156,10 @@ impl AppState {
             .rfind(|playing| playing.destination == Destination::Preview && playing.path == path)
     }
 
-    /// How far the most recently started voice of `path` is, if it plays.
-    pub fn progress(&self, path: &Path, now: Instant) -> Option<f32> {
+    /// How far the most recently started voice of the clip is, if it plays.
+    pub fn progress(&self, clip: &ClipId, now: Instant) -> Option<f32> {
         self.playing_on_board()
-            .filter(|playing| playing.path == path)
+            .filter(|playing| playing.path == clip.path && playing.clip == clip.clip)
             .map(|playing| playing.progress(now))
             .reduce(f32::min)
     }
@@ -163,20 +167,19 @@ impl AppState {
     /// The names of the playing sounds, oldest first.
     pub fn now_playing(&self) -> Vec<String> {
         self.playing_on_board()
-            .map(|playing| match self.library.find(&playing.path) {
-                Some((_, sound)) => self.display_name(sound),
-                None => file_stem(&playing.path),
-            })
+            .map(|playing| self.display_name(&ClipId::new(&playing.path, playing.clip)))
             .collect()
     }
 
     /// The second line of a tile: the trimmed length once known, else the file format; then what
     /// triggers the sound, e.g. `0:01.20 · Note 36 · Ctrl+F13`.
-    pub fn subtitle(&self, sound: &Sound) -> String {
-        let meta = self.sound_config(&sound.path).unwrap_or_default();
-        let length = match self.durations.get(&sound.path) {
+    pub fn subtitle(&self, clip: &ClipId) -> String {
+        let meta = self.sound_config(clip).unwrap_or_default();
+        let length = match self.durations.get(&clip.path) {
             Some(&length) => format_duration(meta.trimmed_length(length)),
-            None => sound.format(),
+            None => (self.library.find(&clip.path))
+                .map(|(_, sound)| sound.format())
+                .unwrap_or_default(),
         };
         let midi = meta.midi.map(|binding| binding.control.to_string());
         let hotkey = meta.hotkey.map(|hotkey| hotkey.to_string());
@@ -199,13 +202,6 @@ impl AppState {
     }
 }
 
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// `m:ss.cc`
 pub fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs_f32();
@@ -218,7 +214,7 @@ mod tests {
 
     use super::*;
     use crate::audio::Trim;
-    use crate::config::TabConfig;
+    use crate::config::{ClipConfig, TabConfig};
     use crate::midi::{MidiBinding, MidiControl};
 
     struct Fixture {
@@ -267,39 +263,122 @@ mod tests {
         }
     }
 
-    fn names(sounds: Vec<&Sound>) -> Vec<&str> {
-        sounds.iter().map(|sound| sound.name.as_str()).collect()
+    /// The file names of `clips`.
+    fn names(clips: Vec<ClipId>) -> Vec<String> {
+        clips.iter().map(|clip| file_stem(&clip.path)).collect()
+    }
+
+    fn shown(state: &AppState) -> Vec<String> {
+        (state.visible_clips().iter())
+            .map(|clip| state.display_name(clip))
+            .collect()
+    }
+
+    /// Gives Airhorn a second clip, "Intro": its first 300 ms at 0.8 on note 36.
+    fn add_intro(state: &mut AppState) -> ClipId {
+        let airhorn = state.visible_clips()[0].clone();
+        let file = state.sound_config_mut(&airhorn).expect("in a tab");
+        file.clips.push(ClipConfig {
+            id: 1,
+            config: SoundConfig {
+                name: Some("Intro".to_owned()),
+                volume: 0.8,
+                end_ms: Some(300),
+                midi: Some(MidiBinding {
+                    port: None,
+                    channel: 1,
+                    control: MidiControl::Note(36),
+                }),
+                ..SoundConfig::default()
+            },
+        });
+        ClipId::new(airhorn.path, 1)
     }
 
     #[test]
     fn shows_the_selected_tab() {
         let mut f = fixture();
-        assert_eq!(names(f.state.visible_sounds()), ["Airhorn", "Bruh"]);
+        assert_eq!(names(f.state.visible_clips()), ["Airhorn", "Bruh"]);
         f.state.select_tab(1);
-        assert_eq!(names(f.state.visible_sounds()), ["Applause", "Horn"]);
+        assert_eq!(names(f.state.visible_clips()), ["Applause", "Horn"]);
     }
 
     #[test]
     fn searching_shows_matches_from_all_tabs() {
         let mut f = fixture();
         f.state.search = "horn".to_owned();
-        assert_eq!(names(f.state.visible_sounds()), ["Airhorn", "Horn"]);
+        assert_eq!(names(f.state.visible_clips()), ["Airhorn", "Horn"]);
         f.state.search = "  ".to_owned();
-        assert_eq!(names(f.state.visible_sounds()), ["Airhorn", "Bruh"]);
+        assert_eq!(names(f.state.visible_clips()), ["Airhorn", "Bruh"]);
     }
 
     #[test]
     fn renamed_sounds_show_and_are_found_by_both_names() {
         let mut f = fixture();
         f.state.select_tab(1);
-        let shown: Vec<String> = (f.state.visible_sounds().iter())
-            .map(|sound| f.state.display_name(sound))
-            .collect();
-        assert_eq!(shown, ["Clapping", "Horn"]);
+        assert_eq!(shown(&f.state), ["Clapping", "Horn"]);
         f.state.search = "CLAP".to_owned();
-        assert_eq!(names(f.state.visible_sounds()), ["Applause"]);
+        assert_eq!(names(f.state.visible_clips()), ["Applause"]);
         f.state.search = "applause".to_owned();
-        assert_eq!(names(f.state.visible_sounds()), ["Applause"]);
+        assert_eq!(names(f.state.visible_clips()), ["Applause"]);
+    }
+
+    #[test]
+    fn more_clips_follow_their_file_and_are_found_by_their_own_name() {
+        let mut f = fixture();
+        let intro = add_intro(&mut f.state);
+        assert_eq!(shown(&f.state), ["Airhorn", "Intro", "Bruh"]);
+        f.state.search = "INTRO".to_owned();
+        assert_eq!(f.state.visible_clips(), std::slice::from_ref(&intro));
+        f.state.search = "airhorn".to_owned();
+        assert_eq!(f.state.visible_clips().len(), 2, "by the file name");
+
+        f.state.search.clear();
+        f.state.sound_config_mut(&intro).expect("exists").name = None;
+        assert_eq!(shown(&f.state), ["Airhorn", "Airhorn (2)", "Bruh"]);
+        assert_eq!(f.state.subtitle(&intro), "MP3 · Note 36");
+    }
+
+    #[test]
+    fn every_clip_plays_its_own_trim_and_volume() {
+        let mut f = fixture();
+        let intro = add_intro(&mut f.state);
+        assert_eq!(
+            f.state.play_request(&intro),
+            Some(PlayRequest {
+                path: intro.path.clone(),
+                clip: 1,
+                trim: Some(Trim {
+                    start_ms: 0,
+                    end_ms: Some(300)
+                }),
+                volume: 0.8,
+                destination: Destination::Everywhere,
+            })
+        );
+        let airhorn = ClipId::file(&intro.path);
+        assert_eq!(f.state.play_request(&airhorn).map(|r| r.volume), Some(0.5));
+        let missing = ClipId::new(&intro.path, 2);
+        assert_eq!(f.state.play_request(&missing), None);
+        assert!(f.state.sound_config_mut(&missing).is_none());
+    }
+
+    #[test]
+    fn progress_is_per_clip() {
+        let mut f = fixture();
+        let intro = add_intro(&mut f.state);
+        let now = Instant::now();
+        f.state.playing = vec![Playing {
+            voice: 0,
+            path: intro.path.clone(),
+            clip: 1,
+            started_at: now,
+            duration: Duration::from_secs(1),
+            destination: Destination::Everywhere,
+        }];
+        assert_eq!(f.state.progress(&intro, now), Some(0.0));
+        assert_eq!(f.state.progress(&ClipId::file(&intro.path), now), None);
+        assert_eq!(f.state.now_playing(), ["Intro"]);
     }
 
     #[test]
@@ -311,19 +390,20 @@ mod tests {
         f.state.library = Library::default();
         f.state.select_tab(1);
         assert_eq!(f.state.tab, 0);
-        assert!(f.state.visible_sounds().is_empty());
+        assert!(f.state.visible_clips().is_empty());
     }
 
     #[test]
     fn plays_use_the_volume_and_trim_from_the_config() {
         let f = fixture();
-        let airhorn = f.state.visible_sounds()[0].path.clone();
-        let bruh = f.state.visible_sounds()[1].path.clone();
+        let airhorn = f.state.visible_clips()[0].clone();
+        let bruh = f.state.visible_clips()[1].clone();
 
         assert_eq!(
             f.state.play_request(&airhorn),
             Some(PlayRequest {
-                path: airhorn,
+                path: airhorn.path,
+                clip: 0,
                 trim: Some(Trim {
                     start_ms: 100,
                     end_ms: Some(900)
@@ -335,33 +415,39 @@ mod tests {
         assert_eq!(
             f.state.play_request(&bruh),
             Some(PlayRequest {
-                path: bruh,
+                path: bruh.path,
+                clip: 0,
                 trim: None,
                 volume: 1.0,
                 destination: Destination::Everywhere,
             })
         );
-        assert_eq!(f.state.play_request(Path::new("/gone.wav")), None);
+        assert_eq!(f.state.play_request(&ClipId::file("/gone.wav")), None);
     }
 
     #[test]
     fn sound_metadata_is_created_on_first_change() {
         let mut f = fixture();
-        let bruh = f.state.visible_sounds()[1].path.clone();
+        let bruh = f.state.visible_clips()[1].clone();
         assert_eq!(f.state.sound_config(&bruh), Some(SoundConfig::default()));
         f.state.sound_config_mut(&bruh).expect("in a tab").volume = 0.3;
         assert_eq!(f.state.config.tabs[0].sounds["Bruh.wav"].volume, 0.3);
-        assert!(f.state.sound_config_mut(Path::new("/gone.wav")).is_none());
+        assert!(
+            f.state
+                .sound_config_mut(&ClipId::file("/gone.wav"))
+                .is_none()
+        );
     }
 
     #[test]
     fn progress_and_names_of_playing_sounds() {
         let mut f = fixture();
-        let airhorn = f.state.visible_sounds()[0].path.clone();
+        let airhorn = f.state.visible_clips()[0].clone();
         let now = Instant::now();
         let voice = |voice, started_at, destination| Playing {
             voice,
-            path: airhorn.clone(),
+            path: airhorn.path.clone(),
+            clip: 0,
             started_at,
             duration: Duration::from_secs(4),
             destination,
@@ -373,10 +459,10 @@ mod tests {
         ];
 
         assert_eq!(f.state.progress(&airhorn, now), Some(0.25));
-        assert_eq!(f.state.progress(Path::new("/other.wav"), now), None);
+        assert_eq!(f.state.progress(&ClipId::file("/other.wav"), now), None);
         assert_eq!(f.state.now_playing(), ["Airhorn", "Airhorn"]);
         assert_eq!(
-            f.state.preview(&airhorn).map(|preview| preview.voice),
+            f.state.preview(&airhorn.path).map(|preview| preview.voice),
             Some(2)
         );
     }
@@ -384,12 +470,12 @@ mod tests {
     #[test]
     fn subtitles_show_the_length_once_known() {
         let mut f = fixture();
-        let [airhorn, bruh] = [0, 1].map(|index| f.state.visible_sounds()[index].clone());
+        let [airhorn, bruh] = [0, 1].map(|index| f.state.visible_clips()[index].clone());
         assert_eq!(f.state.subtitle(&airhorn), "MP3 · Ctrl+Shift+F13");
-        for sound in [&airhorn, &bruh] {
+        for clip in [&airhorn, &bruh] {
             f.state
                 .durations
-                .insert(sound.path.clone(), Duration::from_millis(62_500));
+                .insert(clip.path.clone(), Duration::from_millis(62_500));
         }
         assert_eq!(f.state.subtitle(&bruh), "1:02.50");
         assert_eq!(
@@ -411,8 +497,8 @@ mod tests {
     #[test]
     fn subtitles_show_the_midi_binding() {
         let mut f = fixture();
-        let bruh = f.state.visible_sounds()[1].clone();
-        f.state.sound_config_mut(&bruh.path).expect("in a tab").midi = Some(MidiBinding {
+        let bruh = f.state.visible_clips()[1].clone();
+        f.state.sound_config_mut(&bruh).expect("in a tab").midi = Some(MidiBinding {
             port: None,
             channel: 1,
             control: MidiControl::ControlChange(20),

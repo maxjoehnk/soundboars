@@ -3,6 +3,7 @@
 //! changes state or talks to services itself. Hotkeys and MIDI triggers play without frames, on
 //! the `triggers` thread ([`Dispatcher`]).
 
+mod clips;
 mod hotkeys;
 mod midi;
 mod services;
@@ -28,6 +29,7 @@ use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
 use crate::midi::{HOTPLUG_POLL, MidiEvent, MidiInput, MidiService, MidiTrigger};
 
+pub use clips::ClipId;
 pub use hotkeys::STOP_ALL_ID;
 pub use midi::{LearnTarget, MidiAction, MidiState};
 pub use services::{
@@ -54,7 +56,7 @@ const PLAYING_REPAINT: Duration = Duration::from_millis(50);
 /// Something the user did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Play(PathBuf),
+    Play(ClipId),
     StopAll,
     SelectTab(usize),
     Search(String),
@@ -70,10 +72,15 @@ pub enum Action {
     ChangeSetting(Setting),
     ShowSettings(bool),
     DismissError(usize),
-    /// Opens the "Edit sound" window for the sound at this path.
-    EditSound(PathBuf),
+    /// Opens the "Edit sound" window for this clip.
+    EditSound(ClipId),
     /// Opens the "Edit sound" window with its name field focused.
-    RenameSound(PathBuf),
+    RenameSound(ClipId),
+    /// Adds a clip of the same file, copying this one's name, volume and trim (not its
+    /// triggers), and opens it in the "Edit sound" window to rename and trim it.
+    DuplicateClip(ClipId),
+    /// Removes one of the more clips of a file (not the file's own).
+    DeleteClip(ClipId),
     Editor(EditorAction),
     /// Starts (`true`) or cancels recording the "Stop all" hotkey in the settings.
     RecordStopAllHotkey(bool),
@@ -260,7 +267,7 @@ impl App {
 
     pub fn apply(&mut self, action: Action) {
         match action {
-            Action::Play(path) => self.play(&path),
+            Action::Play(clip) => self.play(&clip),
             Action::StopAll => self.with_audio(|audio| audio.stop_all()),
             Action::SelectTab(tab) => self.state.select_tab(tab),
             Action::Search(query) => self.state.search = query,
@@ -283,13 +290,10 @@ impl App {
                     self.state.errors.remove(index);
                 }
             }
-            Action::EditSound(path) => self.edit_sound(&path),
-            Action::RenameSound(path) => {
-                self.edit_sound(&path);
-                if let Some(editor) = &mut self.state.editor {
-                    editor.focus_name = true;
-                }
-            }
+            Action::EditSound(clip) => self.edit_sound(&clip),
+            Action::RenameSound(clip) => self.rename_sound(&clip),
+            Action::DuplicateClip(clip) => self.duplicate_clip(&clip),
+            Action::DeleteClip(clip) => self.delete_clip(&clip),
             Action::Editor(action) => self.editor_action(action),
             Action::Midi(action) => self.midi_action(action),
             Action::OpenUrlImport => {
@@ -383,28 +387,61 @@ impl App {
                 if let Some(tab) = path.parent().and_then(|dir| self.state.tab_index(dir)) {
                     self.state.select_tab(tab);
                 }
-                self.edit_sound(&path);
+                self.edit_sound(&ClipId::file(path));
             }
         }
     }
 
-    fn edit_sound(&mut self, path: &Path) {
+    fn edit_sound(&mut self, clip: &ClipId) {
+        let path = &clip.path;
         if self.state.library.find(path).is_none() {
             // E.g. a file that was just downloaded, before the folder watcher reported it.
             self.state.library.changed(path);
             self.library_changed();
         }
-        let Some(saved) = self.state.sound_config(path) else {
+        let Some(saved) = self.state.sound_config(clip) else {
             self.show_error(format!("{} is not in any tab", path.display()));
             return;
         };
         self.close_editor();
-        let mut editor = SoundEditor::open(path, &saved);
+        let mut editor = SoundEditor::open(clip, &saved);
         match &self.audio {
             Some(audio) => audio.load_waveform(path),
             None => editor.waveform_loaded(Err("no audio".to_owned())),
         }
         self.state.editor = Some(editor);
+    }
+
+    /// Opens the editor with its name field focused.
+    fn rename_sound(&mut self, clip: &ClipId) {
+        self.edit_sound(clip);
+        if let Some(editor) = &mut self.state.editor {
+            editor.focus_name = true;
+        }
+    }
+
+    /// Adds a copy of the clip and opens it for renaming and trimming.
+    fn duplicate_clip(&mut self, clip: &ClipId) {
+        if let Some(copy) = self.state.duplicate_clip(clip) {
+            self.unsaved = true;
+            self.rename_sound(&copy);
+        }
+    }
+
+    /// Removes the clip, closing the editor if it's open on it.
+    fn delete_clip(&mut self, clip: &ClipId) {
+        if !self.state.delete_clip(clip) {
+            return;
+        }
+        self.unsaved = true;
+        if self
+            .state
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.clip == *clip)
+        {
+            self.close_editor();
+        }
     }
 
     fn editor_action(&mut self, action: EditorAction) {
@@ -436,11 +473,11 @@ impl App {
         if editor.shortcut_id.is_some() {
             return;
         }
-        let saved = self.state.sound_config(&editor.path);
+        let saved = self.state.sound_config(&editor.clip);
         let id = saved
             .and_then(|saved| saved.shortcut_id)
             .unwrap_or_else(|| {
-                let file_name = editor.path.file_name().unwrap_or_default();
+                let file_name = editor.clip.path.file_name().unwrap_or_default();
                 hotkeys::unique_shortcut_id(&self.state.config, &file_name.to_string_lossy())
             });
         if let Some(editor) = &mut self.state.editor {
@@ -450,7 +487,7 @@ impl App {
 
     fn waveform_loaded(&mut self, path: &Path, waveform: Result<Waveform, String>) {
         if let Some(editor) = &mut self.state.editor
-            && editor.path == path
+            && editor.clip.path == path
         {
             editor.waveform_loaded(waveform);
         }
@@ -461,7 +498,7 @@ impl App {
         let Some(editor) = self.state.editor.clone() else {
             return;
         };
-        if let Some(config) = self.state.sound_config_mut(&editor.path) {
+        if let Some(config) = self.state.sound_config_mut(&editor.clip) {
             editor.apply_to(config);
             self.unsaved = true;
         }
@@ -541,8 +578,8 @@ impl App {
         }
     }
 
-    fn play(&mut self, path: &Path) {
-        if let Some(request) = self.state.play_request(path) {
+    fn play(&mut self, clip: &ClipId) {
+        if let Some(request) = self.state.play_request(clip) {
             self.with_audio(|audio| audio.play(request));
         }
     }

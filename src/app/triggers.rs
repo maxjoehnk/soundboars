@@ -82,7 +82,7 @@ impl TriggerTable {
 }
 
 impl AppState {
-    /// What hotkeys and MIDI triggers do right now: play their sounds with the sounds' volume and
+    /// What hotkeys and MIDI triggers do right now: play their clips with the clips' volume and
     /// trim, or "Stop all"; while learning or recording, capture instead.
     pub fn trigger_table(&self) -> TriggerTable {
         let hotkeys = hotkeys::bindings(&self.config)
@@ -91,8 +91,8 @@ impl AppState {
             .collect();
         let stop_all = self.config.settings.midi_stop_all.clone();
         let stop_all = stop_all.map(|binding| (binding, Command::StopAll));
-        let plays = self.bound_sounds().filter_map(|(path, binding)| {
-            let request = self.play_request(path)?;
+        let plays = self.bound_clips().filter_map(|(clip, binding)| {
+            let request = self.play_request(&clip)?;
             Some((binding.clone(), Command::Play(request)))
         });
         TriggerTable {
@@ -104,10 +104,10 @@ impl AppState {
         }
     }
 
-    /// `None` for a sound that isn't in the library (anymore).
+    /// `None` for a clip that isn't in the library (anymore).
     fn command(&self, target: &Target) -> Option<Command> {
         match target {
-            Target::Play(path) => self.play_request(path).map(Command::Play),
+            Target::Play(clip) => self.play_request(clip).map(Command::Play),
             Target::StopAll => Some(Command::StopAll),
         }
     }
@@ -183,7 +183,7 @@ mod tests {
     use super::*;
     use crate::app::LearnTarget;
     use crate::audio::{Destination, Trim};
-    use crate::config::{Config, SoundConfig, TabConfig};
+    use crate::config::{ClipConfig, Config, SoundConfig, TabConfig};
     use crate::midi::MidiControl;
 
     const MPD: &str = "MPD218:MPD218 MIDI 1";
@@ -213,6 +213,7 @@ mod tests {
         fn play(&self, name: &str) -> Command {
             Command::Play(PlayRequest {
                 path: self.dir.path().join(name),
+                clip: 0,
                 trim: None,
                 volume: 1.0,
                 destination: Destination::Everywhere,
@@ -272,6 +273,7 @@ mod tests {
     fn airhorn(f: &Fixture) -> Command {
         Command::Play(PlayRequest {
             path: f.dir.path().join("Airhorn.wav"),
+            clip: 0,
             trim: Some(Trim {
                 start_ms: 100,
                 end_ms: None,
@@ -316,6 +318,38 @@ mod tests {
         );
         assert_eq!(table.resolve(&midi(MidiControl::Note(1))), run(vec![]));
         assert_eq!(table.resolve(&midi(MidiControl::Note(50))), run(vec![]));
+    }
+
+    #[test]
+    fn more_clips_are_triggered_with_their_own_trim_and_volume() {
+        let mut f = fixture();
+        let crickets = f.state.config.tabs[0].sounds.get_mut("Crickets.wav");
+        crickets.expect("configured").clips.push(ClipConfig {
+            id: 1,
+            config: SoundConfig {
+                volume: 0.25,
+                end_ms: Some(400),
+                shortcut_id: Some("play-crickets-2".to_owned()),
+                midi: Some(binding(None, MidiControl::Note(60))),
+                ..SoundConfig::default()
+            },
+        });
+        let clip = Command::Play(PlayRequest {
+            path: f.dir.path().join("Crickets.wav"),
+            clip: 1,
+            trim: Some(Trim {
+                start_ms: 0,
+                end_ms: Some(400),
+            }),
+            volume: 0.25,
+            destination: Destination::Everywhere,
+        });
+        let table = f.state.trigger_table();
+        assert_eq!(
+            table.resolve(&Trigger::Hotkey("play-crickets-2".to_owned())),
+            run(vec![clip.clone()])
+        );
+        assert_eq!(table.resolve(&midi(MidiControl::Note(60))), run(vec![clip]));
     }
 
     #[test]

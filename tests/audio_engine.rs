@@ -140,6 +140,7 @@ fn start_engine() -> AudioEngine {
 fn request(name: &str) -> PlayRequest {
     PlayRequest {
         path: fixture(name),
+        clip: 0,
         trim: None,
         volume: 1.0,
         destination: Destination::Everywhere,

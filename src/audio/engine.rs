@@ -70,7 +70,8 @@ impl AudioEngine {
         self.send(Message::Play(request));
     }
 
-    /// Stops every voice of the sound at `path`, and plays of it still waiting for decoding.
+    /// Stops every voice of every clip of the sound file at `path`, and plays of it still waiting
+    /// for decoding.
     pub fn stop(&self, path: &Path) {
         self.send(Message::Stop(path.to_owned()));
     }

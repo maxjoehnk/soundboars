@@ -4,15 +4,14 @@ use std::time::Instant;
 
 use eframe::egui::{self, Pos2, Rect, Vec2};
 
-use crate::app::{Action, AppState};
-use crate::library::Sound;
+use crate::app::{Action, AppState, ClipId};
 
 const TILE: Vec2 = Vec2::new(170.0, 74.0);
 const SPACING: f32 = 8.0;
 
 pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
-    let sounds = state.visible_sounds();
-    if sounds.is_empty() {
+    let clips = state.visible_clips();
+    if clips.is_empty() {
         ui.centered_and_justified(|ui| ui.weak(empty_message(state)));
         return;
     }
@@ -24,8 +23,8 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
         egui::Grid::new("sounds")
             .spacing([SPACING, SPACING])
             .show(ui, |ui| {
-                for (index, sound) in sounds.iter().enumerate() {
-                    tile(ui, state, sound, now, actions);
+                for (index, clip) in clips.iter().enumerate() {
+                    tile(ui, state, clip, now, actions);
                     if (index + 1) % columns == 0 {
                         ui.end_row();
                     }
@@ -51,12 +50,12 @@ fn empty_message(state: &AppState) -> String {
 fn tile(
     ui: &mut egui::Ui,
     state: &AppState,
-    sound: &Sound,
+    clip: &ClipId,
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
-    let progress = state.progress(&sound.path, now);
-    let label = format!("{}\n{}", state.display_name(sound), state.subtitle(sound));
+    let progress = state.progress(clip, now);
+    let label = format!("{}\n{}", state.display_name(clip), state.subtitle(clip));
     let button = egui::Button::new(label).selected(progress.is_some());
     let response = ui
         .add_enabled_ui(state.audio_available, |ui| ui.add_sized(TILE, button))
@@ -65,21 +64,26 @@ fn tile(
         progress_bar(ui, response.rect, progress);
     }
     if response.clicked() {
-        actions.push(Action::Play(sound.path.clone()));
+        actions.push(Action::Play(clip.clone()));
     }
-    response.context_menu(|ui| context_menu(ui, sound, actions));
-    response.on_hover_text(sound.path.display().to_string());
+    response.context_menu(|ui| context_menu(ui, clip, actions));
+    response.on_hover_text(clip.path.display().to_string());
 }
 
 /// A tile's right-click menu.
-fn context_menu(ui: &mut egui::Ui, sound: &Sound, actions: &mut Vec<Action>) {
-    if ui.button("✏ Edit…").clicked() {
-        actions.push(Action::EditSound(sound.path.clone()));
-        ui.close();
-    }
-    if ui.button("Rename…").clicked() {
-        actions.push(Action::RenameSound(sound.path.clone()));
-        ui.close();
+fn context_menu(ui: &mut egui::Ui, clip: &ClipId, actions: &mut Vec<Action>) {
+    let mut item = |label: &str, action: fn(ClipId) -> Action| {
+        if ui.button(label).clicked() {
+            actions.push(action(clip.clone()));
+            ui.close();
+        }
+    };
+    item("✏ Edit…", Action::EditSound);
+    item("Rename…", Action::RenameSound);
+    item("Duplicate", Action::DuplicateClip);
+    // The file's own clip goes away with the file.
+    if clip.clip != 0 {
+        item("Delete clip", Action::DeleteClip);
     }
 }
 

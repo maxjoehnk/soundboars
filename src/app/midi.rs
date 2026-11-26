@@ -1,10 +1,10 @@
 //! MIDI in the app: learning bindings (what triggers do is in [`super::triggers`]).
 
-use std::path::Path;
-
+use crate::config::SoundConfig;
 use crate::midi::{MidiBinding, MidiDevice, MidiTrigger};
 
 use super::AppState;
+use super::clips::ClipId;
 
 /// What the next trigger is learned for while learning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,23 +49,26 @@ impl MidiState {
 }
 
 impl AppState {
-    /// The names of the sounds, other than the one at `except`, that a trigger of `binding` would
-    /// play as well.
-    pub fn sounds_bound_like(&self, binding: &MidiBinding, except: Option<&Path>) -> Vec<String> {
-        self.bound_sounds()
-            .filter(|(path, other)| Some(*path) != except && other.overlaps(binding))
-            .filter_map(|(path, _)| self.library.find(path))
-            .map(|(_, sound)| sound.name.clone())
+    /// The names of the clips, other than `except`, that a trigger of `binding` would play as
+    /// well.
+    pub fn sounds_bound_like(&self, binding: &MidiBinding, except: Option<&ClipId>) -> Vec<String> {
+        self.bound_clips()
+            .filter(|(clip, other)| Some(clip) != except && other.overlaps(binding))
+            .map(|(clip, _)| self.display_name(&clip))
             .collect()
     }
 
-    /// Every sound in the library that has a MIDI binding.
-    pub(super) fn bound_sounds(&self) -> impl Iterator<Item = (&Path, &MidiBinding)> {
+    /// Every clip in the library that has a MIDI binding.
+    pub(super) fn bound_clips(&self) -> impl Iterator<Item = (ClipId, &MidiBinding)> {
         let folders = self.library.folders().iter().zip(&self.config.tabs);
         folders.flat_map(|(folder, tab)| {
-            folder.sounds.iter().filter_map(|sound| {
-                let binding = tab.sounds.get(&sound.key)?.midi.as_ref()?;
-                Some((sound.path.as_path(), binding))
+            folder.sounds.iter().flat_map(move |sound| {
+                let file = tab.sounds.get(&sound.key).into_iter();
+                file.flat_map(SoundConfig::with_clips)
+                    .filter_map(move |(clip, config)| {
+                        let binding = config.midi.as_ref()?;
+                        Some((ClipId::new(&sound.path, clip), binding))
+                    })
             })
         })
     }
@@ -180,7 +183,7 @@ mod tests {
         let f = fixture();
         let note = binding(Some(MPD), MidiControl::Note(36));
         assert_eq!(f.state.sounds_bound_like(&note, None), ["Airhorn", "Bruh"]);
-        let airhorn = f.path("Airhorn.wav");
+        let airhorn = ClipId::file(f.path("Airhorn.wav"));
         assert_eq!(f.state.sounds_bound_like(&note, Some(&airhorn)), ["Bruh"]);
         let other_port = binding(Some("Other:Other"), MidiControl::Note(36));
         assert_eq!(f.state.sounds_bound_like(&other_port, None), ["Bruh"]);

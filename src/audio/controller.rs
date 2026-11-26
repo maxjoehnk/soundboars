@@ -17,13 +17,16 @@ use super::mixer::{Command, MixerHandle, Play, Retrigger, SoundId, VoiceId};
 use super::service::Event;
 use super::waveform::Waveform;
 
-/// The sound id of previews: unlike file paths, all previews count as one sound.
+/// The sound id of previews: unlike the board's clips, all previews count as one sound.
 const PREVIEW_SOUND: SoundId = SoundId::MAX;
 
 /// Plays a sound file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayRequest {
     pub path: PathBuf,
+    /// Which clip of the file; several clips share one file. Clips retrigger and stop
+    /// independently of each other.
+    pub clip: u32,
     /// Only play this part of the file.
     pub trim: Option<Trim>,
     /// The sound's own volume; `1.0` plays it as it is.
@@ -57,6 +60,8 @@ pub struct Trim {
 pub struct Playing {
     pub voice: VoiceId,
     pub path: PathBuf,
+    /// Which clip of the file; several clips share one file.
+    pub clip: u32,
     pub started_at: Instant,
     /// The length of the (trimmed) sound.
     pub duration: Duration,
@@ -136,7 +141,8 @@ pub struct Controller {
     retrigger: Retrigger,
     target: Option<u32>,
     apps: Vec<RecordingApp>,
-    sound_ids: HashMap<PathBuf, SoundId>,
+    /// By file and clip: each clip is a sound of its own for retriggering.
+    sound_ids: HashMap<(PathBuf, u32), SoundId>,
     /// Plays waiting for their sound to be decoded.
     waiting: Vec<PlayRequest>,
     /// Sounds whose waveform is wanted once they are decoded.
@@ -317,7 +323,7 @@ impl Controller {
         let voice = self.next_voice;
         self.next_voice += 1;
         let (sound_id, retrigger) = match request.destination {
-            Destination::Everywhere => (self.sound_id(&request.path), self.retrigger),
+            Destination::Everywhere => (self.sound_id(&request.path, request.clip), self.retrigger),
             Destination::Preview => (PREVIEW_SOUND, Retrigger::Restart),
         };
         let play = Play {
@@ -336,6 +342,7 @@ impl Controller {
         let playing = Playing {
             voice,
             path: request.path,
+            clip: request.clip,
             started_at: Instant::now(),
             duration: frames_to_duration(end_frame - start_frame),
             destination: request.destination,
@@ -365,9 +372,14 @@ impl Controller {
         }
     }
 
+    /// Stops every clip of the file at `path`.
     fn stop(&mut self, path: &Path) {
         self.waiting.retain(|request| request.path != path);
-        if let Some(&sound_id) = self.sound_ids.get(path) {
+        let sound_ids: Vec<SoundId> = (self.sound_ids.iter())
+            .filter(|((sound_path, _), _)| sound_path == path)
+            .map(|(_, &sound_id)| sound_id)
+            .collect();
+        for sound_id in sound_ids {
             self.send_inject(Command::Stop(sound_id));
             self.send_local(Command::Stop(sound_id));
         }
@@ -444,9 +456,12 @@ impl Controller {
         }
     }
 
-    fn sound_id(&mut self, path: &Path) -> SoundId {
+    fn sound_id(&mut self, path: &Path, clip: u32) -> SoundId {
         let next = self.sound_ids.len() as SoundId;
-        *self.sound_ids.entry(path.to_owned()).or_insert(next)
+        *self
+            .sound_ids
+            .entry((path.to_owned(), clip))
+            .or_insert(next)
     }
 
     fn send_inject(&mut self, command: Command) -> bool {
@@ -619,13 +634,21 @@ mod tests {
 
         /// Plays `path` and lets its decode finish.
         fn play(&mut self, path: &str, trim: Option<Trim>) {
+            self.play_clip(path, 0, trim);
+        }
+
+        /// Plays `clip` of `path` and lets its decode finish (if it wasn't decoded already).
+        fn play_clip(&mut self, path: &str, clip: u32, trim: Option<Trim>) {
             self.send(Message::Play(PlayRequest {
                 path: path.into(),
+                clip,
                 trim,
                 volume: 0.5,
                 destination: Destination::Everywhere,
             }));
-            self.finish_decode();
+            if !self.controller.waiting.is_empty() {
+                self.finish_decode();
+            }
         }
 
         fn finish_decode(&mut self) {
@@ -674,6 +697,7 @@ mod tests {
         fixture.play("a.wav", None);
         fixture.send(Message::Play(PlayRequest {
             path: "a.wav".into(),
+            clip: 0,
             trim: None,
             volume: 1.0,
             destination: Destination::Everywhere,
@@ -691,6 +715,7 @@ mod tests {
 
         let play = PlayRequest {
             path: "a.wav".into(),
+            clip: 0,
             trim: None,
             volume: 1.0,
             destination: Destination::Everywhere,
@@ -780,6 +805,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.send(Message::Play(PlayRequest {
             path: "a.wav".into(),
+            clip: 0,
             trim: None,
             volume: 1.0,
             destination: Destination::Everywhere,
@@ -798,6 +824,42 @@ mod tests {
         fixture.send(Message::Stop("a.wav".into()));
         assert!(matches!(fixture.inject.commands()[..], [Command::Stop(id)] if id == sound_id));
         assert!(matches!(fixture.local.commands()[..], [Command::Stop(id)] if id == sound_id));
+    }
+
+    #[test]
+    fn clips_of_one_file_are_sounds_of_their_own() {
+        let mut fixture = Fixture::new();
+        fixture.send(Message::SetRetrigger(Retrigger::Restart));
+        fixture.play_clip("a.wav", 0, None);
+        fixture.play_clip("a.wav", 1, None);
+        fixture.play_clip("a.wav", 1, None);
+        let plays = fixture.inject.plays();
+        let [first, second, again] = &plays[..] else {
+            panic!("{plays:?}");
+        };
+        assert_ne!(first.sound_id, second.sound_id);
+        assert_eq!(second.sound_id, again.sound_id, "the same clip retriggers");
+        assert!(Arc::ptr_eq(&first.samples, &second.samples), "one decode");
+        let clips: Vec<u32> = fixture.playing().iter().map(|p| p.clip).collect();
+        assert_eq!(clips, [0, 1, 1]);
+    }
+
+    #[test]
+    fn stopping_a_file_stops_all_its_clips() {
+        let mut fixture = Fixture::new();
+        fixture.play_clip("a.wav", 0, None);
+        fixture.play_clip("a.wav", 2, None);
+        fixture.play_clip("b.wav", 0, None);
+        let ids: Vec<SoundId> = fixture.inject.plays().iter().map(|p| p.sound_id).collect();
+        fixture.send(Message::Stop("a.wav".into()));
+        let mut stopped: Vec<SoundId> = (fixture.inject.commands().into_iter())
+            .filter_map(|command| match command {
+                Command::Stop(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        stopped.sort_unstable();
+        assert_eq!(stopped, ids[..2]);
     }
 
     #[test]
@@ -844,6 +906,7 @@ mod tests {
     fn preview(path: &str) -> Message {
         Message::Play(PlayRequest {
             path: path.into(),
+            clip: 0,
             trim: Some(Trim {
                 start_ms: 250,
                 end_ms: None,
@@ -949,6 +1012,7 @@ mod tests {
         let playing = Playing {
             voice: 0,
             path: "a.wav".into(),
+            clip: 0,
             started_at: start,
             duration: Duration::from_secs(2),
             destination: Destination::Everywhere,

@@ -27,7 +27,7 @@ pub fn midi_section(
         }
     });
     if let Some(binding) = &binding {
-        let mut others = state.sounds_bound_like(binding, Some(&editor.path));
+        let mut others = state.sounds_bound_like(binding, Some(&editor.clip));
         let stop_all = state.config.settings.midi_stop_all.as_ref();
         if stop_all.is_some_and(|stop_all| stop_all.overlaps(binding)) {
             others.push("Stop all".to_owned());

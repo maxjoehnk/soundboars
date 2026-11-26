@@ -91,6 +91,7 @@ fn play_into(engine: &AudioEngine, target: &str, file: PathBuf) -> anyhow::Resul
     engine.link_to(app.node_id);
     engine.play(PlayRequest {
         path: file,
+        clip: 0,
         trim: None,
         volume: 1.0,
         destination: Destination::Everywhere,

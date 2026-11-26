@@ -48,7 +48,7 @@ fn name_section(ui: &mut egui::Ui, editor: &SoundEditor, actions: &mut Vec<Actio
         let caption = ui.label("Name:");
         let mut name = editor.name.clone();
         let field = egui::TextEdit::singleline(&mut name)
-            .hint_text(editor.file_stem())
+            .hint_text(editor.default_name())
             .desired_width(240.0);
         let response = ui.add(field).labelled_by(caption.id);
         if response.changed() {
@@ -99,7 +99,7 @@ fn placeholder(ui: &mut egui::Ui, size: Vec2, message: &str, color: Option<Color
 
 /// Where the preview is now, while it plays.
 fn playhead_ms(state: &AppState, editor: &SoundEditor) -> Option<u64> {
-    let preview = state.preview(&editor.path)?;
+    let preview = state.preview(&editor.clip.path)?;
     Some(editor.playhead_ms(preview, Instant::now()))
 }
 
@@ -242,7 +242,7 @@ fn preview_button(
     editor: &SoundEditor,
     actions: &mut Vec<Action>,
 ) {
-    let playing = state.preview(&editor.path).is_some();
+    let playing = state.preview(&editor.clip.path).is_some();
     let (label, edit) = if playing {
         ("⏹ Stop", EditorAction::StopPreview)
     } else {

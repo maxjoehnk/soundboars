@@ -18,7 +18,7 @@ use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
 use soundboars::config::{
-    Config, ConfigStore, Injection, SavedTarget, SoundConfig, TabConfig, Theme,
+    ClipConfig, Config, ConfigStore, Injection, SavedTarget, SoundConfig, TabConfig, Theme,
 };
 use soundboars::hotkeys::{
     BackendKind, BindHint, Binding, Capabilities, EventSink, Hotkey, HotkeyBackend, HotkeyEvent,
@@ -423,6 +423,7 @@ fn clicking_a_tile_plays_it_with_its_volume_and_trim() {
         setup.shared.calls(),
         [Call::Play(PlayRequest {
             path: setup.folder("Memes").join("Airhorn.wav"),
+            clip: 0,
             trim: Some(Trim {
                 start_ms: 100,
                 end_ms: Some(900)
@@ -618,6 +619,7 @@ fn stop_all_stops_and_playing_sounds_are_shown() {
         world.playing.push(Playing {
             voice: 0,
             path,
+            clip: 0,
             started_at: Instant::now(),
             duration: Duration::from_secs(60),
             destination: Destination::Everywhere,
@@ -963,6 +965,170 @@ fn renaming_shows_the_new_name_on_the_tile_and_keeps_the_file() {
     assert!(harness.query_by_label_contains("Airhorn\n").is_none());
 }
 
+/// Right-clicks the tile labelled `name` and picks `item` from its menu.
+fn tile_menu(harness: &mut Harness<'_, AppWindows>, name: &str, item: &str) {
+    harness.get_by_label_contains(&tile(name)).click_secondary();
+    harness.run();
+    harness.get_by_label(item).click();
+    harness.run();
+}
+
+/// Clicks the tile labelled `name` and returns what it played.
+fn click_tile(setup: &Setup, harness: &mut Harness<'_, AppWindows>, name: &str) -> Vec<Call> {
+    setup.shared.clear_calls();
+    harness.get_by_label(&tile(name)).click();
+    harness.run();
+    setup.shared.calls()
+}
+
+fn airhorn_clip(setup: &Setup, clip: u32, start_ms: u64) -> Call {
+    Call::Play(PlayRequest {
+        path: airhorn(setup),
+        clip,
+        trim: Some(Trim {
+            start_ms,
+            end_ms: Some(900),
+        }),
+        volume: 0.5,
+        destination: Destination::Everywhere,
+    })
+}
+
+#[test]
+fn a_duplicated_clip_is_trimmed_on_its_own_and_plays_its_own_part() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    let original = saved_airhorn(&setup);
+
+    tile_menu(&mut harness, "Airhorn", "Duplicate");
+
+    assert!(harness.query_by_label(EDITOR).is_some());
+    let field = harness.get_by_label("Name:");
+    assert!(field.is_focused());
+    assert_eq!(field.value().as_deref(), Some("Airhorn (2)"));
+    deliver_waveform(&setup, &mut harness);
+    harness.get_by_label("Start").set_value_accesskit(0.5);
+    harness.run();
+    click_editor_button(&mut harness, "Save");
+
+    // Its name is the default name of the file's second clip, so it isn't stored.
+    assert!(harness.query_by_label(&tile("Airhorn (2)")).is_some());
+    let saved = saved_airhorn(&setup);
+    assert_eq!(
+        saved.clips,
+        [ClipConfig {
+            id: 1,
+            config: SoundConfig {
+                name: None,
+                volume: 0.5,
+                start_ms: 500,
+                end_ms: Some(900),
+                ..SoundConfig::default()
+            },
+        }]
+    );
+    assert_eq!(
+        SoundConfig {
+            clips: Vec::new(),
+            ..saved
+        },
+        original
+    );
+    assert!(airhorn(&setup).exists());
+    assert_eq!(
+        click_tile(&setup, &mut harness, "Airhorn"),
+        [airhorn_clip(&setup, 0, 100)]
+    );
+    assert_eq!(
+        click_tile(&setup, &mut harness, "Airhorn (2)"),
+        [airhorn_clip(&setup, 1, 500)]
+    );
+}
+
+#[test]
+fn deleting_a_clip_removes_its_tile_and_its_global_shortcut() {
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav");
+        airhorn.expect("configured").clips.push(ClipConfig {
+            id: 1,
+            config: SoundConfig {
+                name: Some("Intro".to_owned()),
+                shortcut_id: Some("play-airhorn-2".to_owned()),
+                ..SoundConfig::default()
+            },
+        });
+    });
+    let mut harness = setup.start();
+    let original = saved_airhorn(&setup);
+    assert_eq!(
+        registered(&setup),
+        [
+            binding("stop-all", "Stop all sounds", None),
+            binding("play-airhorn-2", "Play Intro", None),
+        ]
+    );
+    harness
+        .get_by_label_contains(&tile("Airhorn"))
+        .click_secondary();
+    harness.run();
+    assert!(
+        harness.query_by_label("Delete clip").is_none(),
+        "the file's own clip can't be deleted"
+    );
+    harness.key_press(Key::Escape);
+    harness.run();
+
+    tile_menu(&mut harness, "Intro", "Delete clip");
+
+    assert!(harness.query_by_label_contains("Intro\n").is_none());
+    assert!(harness.query_by_label(&tile("Airhorn")).is_some());
+    assert_eq!(
+        saved_airhorn(&setup),
+        SoundConfig {
+            clips: Vec::new(),
+            ..original
+        }
+    );
+    assert_eq!(
+        registered(&setup),
+        [binding("stop-all", "Stop all sounds", None)]
+    );
+}
+
+#[test]
+fn deleting_the_clip_open_in_the_editor_closes_it() {
+    // Four more clips of Airhorn: "D" is the fifth tile, right of the editor window (kittest
+    // embeds it in the main window, over the first tiles).
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav");
+        let airhorn = airhorn.expect("configured");
+        for (id, name) in (1..).zip(["A", "B", "C", "D"]) {
+            airhorn.clips.push(ClipConfig {
+                id,
+                config: SoundConfig {
+                    name: Some(name.to_owned()),
+                    ..SoundConfig::default()
+                },
+            });
+        }
+    });
+    let mut harness = setup.start();
+    tile_menu(&mut harness, "D", "✏ Edit…");
+    assert!(harness.query_by_label(EDITOR).is_some());
+    assert_eq!(harness.get_by_label("Name:").value().as_deref(), Some("D"));
+
+    tile_menu(&mut harness, "D", "Delete clip");
+
+    assert!(harness.query_by_label(EDITOR).is_none());
+    let names: Vec<Option<String>> = (saved_airhorn(&setup).clips.into_iter())
+        .map(|clip| clip.config.name)
+        .collect();
+    assert_eq!(
+        names,
+        [Some("A"), Some("B"), Some("C")].map(|n| n.map(str::to_owned))
+    );
+}
+
 #[test]
 fn a_waveform_that_cannot_be_decoded_is_explained() {
     let setup = Setup::new();
@@ -1069,6 +1235,7 @@ fn saved_changes_are_played() {
         setup.shared.calls(),
         [Call::Play(PlayRequest {
             path: airhorn(&setup),
+            clip: 0,
             trim: Some(Trim {
                 start_ms: 500,
                 end_ms: Some(900),
@@ -1112,6 +1279,7 @@ fn preview_plays_the_edited_sound_locally_and_stops_on_close() {
         setup.shared.calls(),
         [Call::Play(PlayRequest {
             path: airhorn(&setup),
+            clip: 0,
             trim: Some(Trim {
                 start_ms: 300,
                 end_ms: Some(900),
@@ -1125,6 +1293,7 @@ fn preview_plays_the_edited_sound_locally_and_stops_on_close() {
     let preview = Playing {
         voice: 7,
         path: airhorn(&setup),
+        clip: 0,
         started_at: Instant::now(),
         duration: Duration::from_millis(600),
         destination: Destination::Preview,
@@ -1215,6 +1384,7 @@ fn run_until(
 fn airhorn_request(setup: &Setup) -> PlayRequest {
     PlayRequest {
         path: airhorn(setup),
+        clip: 0,
         trim: Some(Trim {
             start_ms: 100,
             end_ms: Some(900),

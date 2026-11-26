@@ -3,12 +3,13 @@
 //! thread ([`super::triggers`]).
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 
-use crate::config::Config;
+use crate::config::{Config, SoundConfig};
 use crate::hotkeys::{BackendKind, Binding, Capabilities, EventSink, HotkeyBackend, HotkeyEvent};
 
+use super::clips::{self, ClipId};
 use super::services::HotkeyBackends;
 use super::triggers::Trigger;
 
@@ -18,11 +19,11 @@ pub const STOP_ALL_ID: &str = "stop-all";
 /// What a binding does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    Play(PathBuf),
+    Play(ClipId),
     StopAll,
 }
 
-/// The bindings the config asks for: every sound with a shortcut id, and "Stop all".
+/// The bindings the config asks for: every clip with a shortcut id, and "Stop all".
 pub fn bindings(config: &Config) -> Vec<(Binding, Target)> {
     let mut ids = HashSet::from([STOP_ALL_ID]);
     let mut bindings = vec![(
@@ -34,36 +35,42 @@ pub fn bindings(config: &Config) -> Vec<(Binding, Target)> {
         Target::StopAll,
     )];
     for tab in &config.tabs {
-        for (key, sound) in &tab.sounds {
-            let Some(id) = &sound.shortcut_id else {
-                continue;
-            };
-            if !ids.insert(id) {
-                tracing::warn!("the shortcut id {id} is used twice, ignoring it for {key}");
-                continue;
+        for (key, file) in &tab.sounds {
+            for (clip, sound) in file.with_clips() {
+                let Some(id) = &sound.shortcut_id else {
+                    continue;
+                };
+                if !ids.insert(id) {
+                    tracing::warn!("the shortcut id {id} is used twice, ignoring it for {key}");
+                    continue;
+                }
+                let binding = Binding {
+                    id: id.clone(),
+                    description: format!("Play {}", clip_name(key, clip, sound)),
+                    hotkey: sound.hotkey,
+                };
+                let target = Target::Play(ClipId::new(tab.path.join(key), clip));
+                bindings.push((binding, target));
             }
-            let binding = Binding {
-                id: id.clone(),
-                description: format!(
-                    "Play {}",
-                    sound.name.clone().unwrap_or_else(|| file_stem(key))
-                ),
-                hotkey: sound.hotkey,
-            };
-            bindings.push((binding, Target::Play(tab.path.join(key))));
         }
     }
     bindings
 }
 
-/// A new shortcut id for the sound `file_name`: `play-<slug>`, made unique in `config` with a
-/// number suffix.
+/// The name of the clip `clip` of the sound `key`, as its tile shows it.
+fn clip_name(key: &str, clip: u32, sound: &SoundConfig) -> String {
+    (sound.name.clone()).unwrap_or_else(|| clips::default_name(&file_stem(key), clip))
+}
+
+/// A new shortcut id for a clip of the sound `file_name`: `play-<slug>`, made unique among all
+/// clips in `config` with a number suffix.
 pub fn unique_shortcut_id(config: &Config, file_name: &str) -> String {
     let taken: HashSet<&str> = config
         .tabs
         .iter()
         .flat_map(|tab| tab.sounds.values())
-        .filter_map(|sound| sound.shortcut_id.as_deref())
+        .flat_map(SoundConfig::with_clips)
+        .filter_map(|(_, sound)| sound.shortcut_id.as_deref())
         .chain([STOP_ALL_ID])
         .collect();
     let base = format!("play-{}", slug(&file_stem(file_name)));
@@ -191,7 +198,7 @@ impl Hotkeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SoundConfig, TabConfig};
+    use crate::config::{ClipConfig, TabConfig};
 
     fn sound(shortcut_id: Option<&str>, hotkey: Option<&str>) -> SoundConfig {
         SoundConfig {
@@ -252,16 +259,71 @@ mod tests {
                     "play-air-horn",
                     "Play Air horn",
                     Some("Ctrl+F13".to_owned()),
-                    &Target::Play("/sounds/Memes/Air horn.mp3".into())
+                    &Target::Play(ClipId::file("/sounds/Memes/Air horn.mp3"))
                 ),
                 (
                     "play-applause",
                     "Play Applause",
                     None,
-                    &Target::Play("/sounds/SFX/Applause.ogg".into())
+                    &Target::Play(ClipId::file("/sounds/SFX/Applause.ogg"))
                 ),
             ],
             "Bruh has no shortcut; Copy's duplicate id is skipped"
+        );
+    }
+
+    fn with_clips(mut file: SoundConfig, clips: Vec<(u32, SoundConfig)>) -> SoundConfig {
+        file.clips = (clips.into_iter())
+            .map(|(id, config)| ClipConfig { id, config })
+            .collect();
+        file
+    }
+
+    #[test]
+    fn more_clips_of_a_sound_are_bound_by_their_own_shortcut_id() {
+        let mut config = Config::default();
+        let mut tab = TabConfig::for_folder("/sounds".into());
+        let named = SoundConfig {
+            name: Some("Horn intro".to_owned()),
+            ..sound(Some("play-air-horn-3"), Some("Alt+1"))
+        };
+        let clips = vec![
+            (2, sound(Some("play-air-horn-2"), None)),
+            (3, sound(None, None)),
+            (4, named),
+        ];
+        tab.sounds.insert(
+            "Air horn.mp3".to_owned(),
+            with_clips(sound(None, None), clips),
+        );
+        config.tabs.push(tab);
+
+        let bindings = bindings(&config);
+        let summary: Vec<(&str, &str, &Target)> = (bindings.iter().skip(1))
+            .map(|(binding, target)| (binding.id.as_str(), binding.description.as_str(), target))
+            .collect();
+        let clip = |id| Target::Play(ClipId::new("/sounds/Air horn.mp3", id));
+        assert_eq!(
+            summary,
+            [
+                ("play-air-horn-2", "Play Air horn (3)", &clip(2)),
+                ("play-air-horn-3", "Play Horn intro", &clip(4)),
+            ]
+        );
+        assert_eq!(
+            unique_shortcut_id(&config, "Air horn.mp3"),
+            "play-air-horn",
+            "the file's own clip has none"
+        );
+        config.tabs[0]
+            .sounds
+            .get_mut("Air horn.mp3")
+            .expect("inserted")
+            .shortcut_id = Some("play-air-horn".to_owned());
+        assert_eq!(
+            unique_shortcut_id(&config, "Air horn.mp3"),
+            "play-air-horn-4",
+            "ids of more clips are taken too"
         );
     }
 
