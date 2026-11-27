@@ -19,7 +19,8 @@ device in the call app and it carries your real microphone plus the sounds.
 - Global hotkeys (XDG GlobalShortcuts portal or X11) and MIDI controllers (learn mode, hotplug).
   Both work while the window is hidden or on another workspace.
 - "Stop all" button, hotkey and MIDI binding.
-- Import sounds from YouTube or any other site yt-dlp supports, then trim them.
+- Import sounds from YouTube or any other site yt-dlp supports, then trim them. Age-restricted or
+  members-only videos work with your browser's cookies (see below).
 
 ## Requirements
 
@@ -50,6 +51,21 @@ cargo build --release
 
 The config lives in `~/.config/soundboars/config.toml` (`$SOUNDBOARS_CONFIG` overrides it). Logs
 go to stderr; `RUST_LOG=debug` shows more.
+
+## Age-restricted videos
+
+Some videos only download while you're logged in. Choose your browser in **Settings → Cookies from
+browser** and yt-dlp reads its cookies (`--cookies-from-browser`). Without a profile it takes the
+most recently used one; a profile name or path picks another. A path also works for Firefox forks
+(e.g. `~/.librewolf/<profile>`) and for Flatpak/Snap installs of Chromium-based browsers (Firefox
+from Flatpak or Snap is found on its own).
+
+Chromium-based browsers (Chrome, Chromium, Brave, Edge, Opera, Vivaldi, Whale) encrypt their
+cookies with a key from the desktop's keyring. yt-dlp picks the keyring from the desktop: KWallet
+on KDE (needs `kwallet-query`), GNOME Keyring on GNOME and similar desktops (needs Python's
+`secretstorage` module), none on desktops it doesn't know (e.g. Hyprland). If it can't get the
+key, the download fails with yt-dlp's error, or the cookies can't be decrypted; Firefox's
+cookies aren't encrypted.
 
 ## Desktop entry and icon
 

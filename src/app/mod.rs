@@ -28,7 +28,7 @@ use crate::audio::{EngineEvent, Retrigger, Waveform};
 use crate::color::TileColor;
 use crate::config::{ConfigStore, Injection, SavedTarget, Settings, TabConfig, Theme};
 use crate::hotkeys::{BackendKind, Hotkey};
-use crate::import::{DownloadEvent, Downloader};
+use crate::import::{BrowserCookies, DownloadEvent, Downloader};
 use crate::library::durations::DurationProbe;
 use crate::library::watch::{FolderEvent, FolderWatcher};
 use crate::midi::{HOTPLUG_POLL, MidiEvent, MidiInput, MidiService, MidiTrigger};
@@ -107,7 +107,7 @@ pub enum Action {
 }
 
 /// A change to [`Settings`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Setting {
     CallVolume(f32),
     LocalVolume(f32),
@@ -116,6 +116,7 @@ pub enum Setting {
     Theme(Theme),
     HotkeyBackend(BackendKind),
     StopAllHotkey(Option<Hotkey>),
+    CookiesFromBrowser(Option<BrowserCookies>),
 }
 
 impl Setting {
@@ -128,17 +129,21 @@ impl Setting {
             Self::Theme(theme) => settings.theme = theme,
             Self::HotkeyBackend(kind) => settings.hotkey_backend = Some(kind),
             Self::StopAllHotkey(hotkey) => settings.stop_all_hotkey = hotkey,
+            Self::CookiesFromBrowser(cookies) => settings.cookies_from_browser = cookies,
         }
     }
 
     /// Tells the audio engine, if the setting concerns it.
-    fn apply_to(self, audio: &dyn AudioBackend) {
-        match self {
+    fn apply_to(&self, audio: &dyn AudioBackend) {
+        match *self {
             Self::CallVolume(volume) => audio.set_call_volume(volume),
             Self::LocalVolume(volume) => audio.set_local_volume(volume),
             Self::LocalEnabled(enabled) => audio.set_local_enabled(enabled),
             Self::Retrigger(retrigger) => audio.set_retrigger_policy(retrigger),
-            Self::Theme(_) | Self::HotkeyBackend(_) | Self::StopAllHotkey(_) => {}
+            Self::Theme(_)
+            | Self::HotkeyBackend(_)
+            | Self::StopAllHotkey(_)
+            | Self::CookiesFromBrowser(_) => {}
         }
     }
 }
@@ -389,7 +394,8 @@ impl App {
         match action {
             UrlImportAction::Download => {
                 if let Some((url, folder)) = import.start(&self.state.config.tabs) {
-                    self.downloader.start(&url, &folder);
+                    let cookies = self.state.config.settings.cookies_from_browser.as_ref();
+                    self.downloader.start(&url, &folder, cookies);
                 }
             }
             UrlImportAction::Close => {
@@ -769,8 +775,8 @@ impl App {
         if let Setting::StopAllHotkey(_) = setting {
             self.state.recording_stop_all = false;
         }
-        setting.write_to(&mut self.state.config.settings);
         self.with_audio(|audio| setting.apply_to(audio));
+        setting.write_to(&mut self.state.config.settings);
         self.unsaved = true;
     }
 

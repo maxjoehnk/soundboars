@@ -16,7 +16,9 @@ use std::thread;
 
 use tempfile::TempDir;
 
-use super::{DownloadEvent, Downloader, Stage, TOOLS, missing_tools, unavailable_message};
+use super::{
+    BrowserCookies, DownloadEvent, Downloader, Stage, TOOLS, missing_tools, unavailable_message,
+};
 
 const PROGRAM: &str = "yt-dlp";
 /// Prefixes of the lines we make yt-dlp print on stdout.
@@ -31,9 +33,15 @@ const MAX_NAME_LENGTH: usize = 120;
 const STDERR_LINES: usize = 20;
 
 /// The `yt-dlp` command line that downloads the audio of `url` as MP3 into `folder`, working in
-/// `staging`. The file is named after the page's title (sanitized and shortened); an existing file
-/// is never overwritten (yt-dlp reports it as done instead).
-pub fn command(url: &str, folder: &Path, staging: &Path) -> Command {
+/// `staging`, with the browser's `cookies` if given. The file is named after the page's title
+/// (sanitized and shortened); an existing file is never overwritten (yt-dlp reports it as done
+/// instead).
+pub fn command(
+    url: &str,
+    folder: &Path,
+    staging: &Path,
+    cookies: Option<&BrowserCookies>,
+) -> Command {
     let mut command = Command::new(PROGRAM);
     command
         // Ignore the user's yt-dlp config: it could change the output name or format.
@@ -41,7 +49,11 @@ pub fn command(url: &str, folder: &Path, staging: &Path) -> Command {
         .args(["--extract-audio", "--audio-format", "mp3"])
         .args(["--windows-filenames", "--trim-filenames"])
         .arg(MAX_NAME_LENGTH.to_string())
-        .arg("--no-overwrites")
+        .arg("--no-overwrites");
+    if let Some(cookies) = cookies {
+        command.args(["--cookies-from-browser", &cookies.argument()]);
+    }
+    command
         // `--print` implies `--quiet`; `--progress` keeps the progress lines.
         .args(["--newline", "--progress", "--progress-template"])
         .arg(format!(
@@ -210,9 +222,9 @@ impl Downloader for YtDlp {
         self.unavailable.clone()
     }
 
-    fn start(&mut self, url: &str, folder: &Path) {
+    fn start(&mut self, url: &str, folder: &Path, cookies: Option<&BrowserCookies>) {
         self.cancel();
-        match Running::start(url, folder) {
+        match Running::start(url, folder, cookies) {
             Ok(running) => self.running = Some(running),
             Err(error) => self.queued.push(DownloadEvent::Failed(format!(
                 "Could not start yt-dlp: {error}"
@@ -257,11 +269,11 @@ struct Running {
 }
 
 impl Running {
-    fn start(url: &str, folder: &Path) -> std::io::Result<Self> {
+    fn start(url: &str, folder: &Path, cookies: Option<&BrowserCookies>) -> std::io::Result<Self> {
         let staging = tempfile::Builder::new()
             .prefix(STAGING_PREFIX)
             .tempdir_in(folder)?;
-        let mut child = command(url, folder, staging.path())
+        let mut child = command(url, folder, staging.path(), cookies)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -367,6 +379,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     use super::*;
+    use crate::import::Browser;
 
     /// yt-dlp 2025.04.30's stdout for a 576078 bytes WAV from a local HTTP server.
     const SUCCESS: &str = "\
@@ -390,21 +403,25 @@ soundboars-done /s/out/tone.mp3";
         lines.iter().map(|line| (*line).to_owned()).collect()
     }
 
-    #[test]
-    fn the_command_line_is_exactly_as_intended() {
+    /// The arguments of the command for a fixed URL and folder.
+    fn args(cookies: Option<&BrowserCookies>) -> Vec<String> {
         let command = command(
             "https://example.com/watch?v=1",
             Path::new("/sounds/My: Memes"),
             Path::new("/sounds/My: Memes/.soundboars-download-x"),
+            cookies,
         );
-        let args: Vec<&str> = command
-            .get_args()
-            .map(|arg| arg.to_str().expect("UTF-8"))
-            .collect();
-
         assert_eq!(command.get_program(), "yt-dlp");
+        command
+            .get_args()
+            .map(|arg| arg.to_str().expect("UTF-8").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_command_line_is_exactly_as_intended() {
         assert_eq!(
-            args,
+            args(None),
             [
                 "--ignore-config",
                 "--no-playlist",
@@ -435,6 +452,28 @@ soundboars-done /s/out/tone.mp3";
                 "https://example.com/watch?v=1",
             ]
         );
+    }
+
+    #[test]
+    fn browser_cookies_add_one_option_after_no_overwrites() {
+        let with_cookies = |profile: Option<&str>| {
+            let cookies = BrowserCookies::new(Browser::Firefox, profile.map(str::to_owned));
+            args(Some(&cookies))
+        };
+        let mut expected = args(None);
+        let at = expected
+            .iter()
+            .position(|arg| arg == "--no-overwrites")
+            .expect("in the args")
+            + 1;
+        expected.splice(
+            at..at,
+            ["--cookies-from-browser".to_owned(), "firefox".to_owned()],
+        );
+        assert_eq!(with_cookies(None), expected);
+
+        expected[at + 1] = "firefox:~/.librewolf/abc.default".to_owned();
+        assert_eq!(with_cookies(Some("~/.librewolf/abc.default")), expected);
     }
 
     #[test]

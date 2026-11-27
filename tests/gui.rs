@@ -24,7 +24,7 @@ use soundboars::config::{
 use soundboars::hotkeys::{
     BackendKind, BindHint, Binding, Capabilities, EventSink, Hotkey, HotkeyBackend, HotkeyEvent,
 };
-use soundboars::import::{DownloadEvent, Downloader, Stage};
+use soundboars::import::{Browser, BrowserCookies, DownloadEvent, Downloader, Stage};
 use soundboars::library::watch::{FolderEvent, FolderWatcher};
 use soundboars::midi::{
     Connection, MidiBinding, MidiControl, MidiDevice, MidiError, MidiInput, MidiPort, OnMessage,
@@ -70,6 +70,8 @@ struct World {
     downloader_unavailable: Option<String>,
     /// The `(url, folder)` of every started download.
     downloads: Vec<(String, PathBuf)>,
+    /// The cookies option of each of `downloads`.
+    download_cookies: Vec<Option<BrowserCookies>>,
     cancelled_downloads: usize,
     download_events: Vec<DownloadEvent>,
 }
@@ -256,9 +258,11 @@ impl Downloader for FakeDownloader {
     fn unavailable(&self) -> Option<String> {
         self.0.with(|world| world.downloader_unavailable.clone())
     }
-    fn start(&mut self, url: &str, folder: &Path) {
-        self.0
-            .with(|world| world.downloads.push((url.to_owned(), folder.to_owned())));
+    fn start(&mut self, url: &str, folder: &Path, cookies: Option<&BrowserCookies>) {
+        self.0.with(|world| {
+            world.downloads.push((url.to_owned(), folder.to_owned()));
+            world.download_cookies.push(cookies.cloned());
+        });
     }
     fn cancel(&mut self) {
         self.0.with(|world| world.cancelled_downloads += 1);
@@ -1352,15 +1356,7 @@ fn preview_plays_the_edited_sound_locally_and_stops_on_close() {
     assert_eq!(setup.shared.calls(), [Call::StopPreview]);
 
     setup.shared.clear_calls();
-    // Closing the dialog's window. Kittest embeds dialogs in the main window, where its close
-    // request is the one of the main viewport.
-    harness
-        .input_mut()
-        .viewports
-        .entry(ViewportId::ROOT)
-        .or_default()
-        .events
-        .push(ViewportEvent::Close);
+    close_dialog(&mut harness);
     harness.run();
     assert!(harness.query_by_label(EDITOR).is_none());
     assert_eq!(setup.shared.calls(), [Call::StopPreview]);
@@ -1720,7 +1716,8 @@ fn switching_the_hotkey_backend_starts_it_and_registers_again() {
             .is_some()
     );
 
-    harness.get_by_label("Off").click();
+    let off = harness.query_all_by_label("Off").collect::<Vec<_>>();
+    off.last().expect("the picker lists Off").click();
     harness.run();
     assert_eq!(
         setup.config().settings.hotkey_backend,
@@ -2189,14 +2186,7 @@ fn closing_the_dialog_cancels_the_download() {
     enter_url(&mut harness, "https://example.com/long");
     harness.get_by_label(DOWNLOAD).click();
     harness.run_steps(STEPS);
-    // Kittest embeds dialogs in the main window, where its close request is the main viewport's.
-    harness
-        .input_mut()
-        .viewports
-        .entry(ViewportId::ROOT)
-        .or_default()
-        .events
-        .push(ViewportEvent::Close);
+    close_dialog(&mut harness);
     harness.run_steps(STEPS);
 
     assert!(harness.query_by_label(URL_DIALOG).is_none());
@@ -2232,6 +2222,90 @@ fn without_tabs_the_dialog_asks_for_a_folder_first() {
         downloads(&setup),
         [("https://example.com/a".to_owned(), music)]
     );
+}
+
+#[test]
+fn downloads_use_the_cookies_chosen_in_the_settings() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    assert_eq!(
+        harness.get_by_label(COOKIES).value().as_deref(),
+        Some("Off")
+    );
+    assert!(harness.get_by_label(PROFILE).accesskit_node().is_disabled());
+
+    harness.get_by_label(COOKIES).click();
+    harness.run();
+    harness.get_by_label("Firefox").click();
+    harness.run();
+    assert!(!harness.get_by_label(PROFILE).accesskit_node().is_disabled());
+    let field = harness.get_by_label(PROFILE);
+    field.click();
+    field.type_text("~/.librewolf/abc.default");
+    harness.run();
+
+    let librewolf = BrowserCookies::new(Browser::Firefox, Some("~/.librewolf/abc.default".into()));
+    assert_eq!(
+        setup.config().settings.cookies_from_browser,
+        Some(librewolf.clone())
+    );
+    close_dialog(&mut harness);
+    harness.run();
+    enter_url(&mut harness, "https://example.com/age-restricted");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+    assert_eq!(download_cookies(&setup), [Some(librewolf)]);
+}
+
+#[test]
+fn turning_cookies_off_disables_the_profile_and_downloads_without() {
+    let firefox = BrowserCookies::new(Browser::Firefox, Some("default-release".into()));
+    let setup = Setup::new().with_config(|config| {
+        config.settings.cookies_from_browser = Some(firefox.clone());
+    });
+    let mut harness = setup.start();
+    harness.get_by_label("⚙ Settings").click();
+    harness.run();
+    assert_eq!(
+        harness.get_by_label(PROFILE).value().as_deref(),
+        Some("default-release")
+    );
+
+    harness.get_by_label(COOKIES).click();
+    harness.run();
+    let off = harness.query_all_by_label("Off").collect::<Vec<_>>();
+    off.last().expect("the picker lists Off").click();
+    harness.run();
+
+    assert_eq!(setup.config().settings.cookies_from_browser, None);
+    assert!(harness.get_by_label(PROFILE).accesskit_node().is_disabled());
+    close_dialog(&mut harness);
+    harness.run();
+    enter_url(&mut harness, "https://example.com/a");
+    harness.get_by_label(DOWNLOAD).click();
+    harness.run_steps(STEPS);
+    assert_eq!(download_cookies(&setup), [None]);
+}
+
+const COOKIES: &str = "Cookies from browser:";
+const PROFILE: &str = "Profile:";
+
+/// Closes the open dialog's window. Kittest embeds dialogs in the main window, where its close
+/// request is the one of the main viewport.
+fn close_dialog(harness: &mut Harness<'_, AppWindows>) {
+    harness
+        .input_mut()
+        .viewports
+        .entry(ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(ViewportEvent::Close);
+}
+
+fn download_cookies(setup: &Setup) -> Vec<Option<BrowserCookies>> {
+    setup.shared.with(|world| world.download_cookies.clone())
 }
 
 // Rename dialog, tile layout, colors and order.

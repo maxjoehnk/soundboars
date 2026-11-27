@@ -280,6 +280,15 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   `--no-overwrites`, output `%(title)s.%(ext)s`. Progress comes from our own `--progress-template`
   / `--print post_process:` / `--print after_move:%(filepath)s` lines on stdout; the error message
   is yt-dlp's `ERROR:` lines (else its last stderr lines).
+- Cookies (age-restricted/members-only videos): `--ignore-config` means the user's yt-dlp config
+  can't supply them, so `Settings::cookies_from_browser: Option<import::BrowserCookies { browser,
+  profile }>` (`[settings.cookies_from_browser]`, `browser` = yt-dlp's name, `profile` optional;
+  lenient: an unknown browser is dropped with a warning, a blank profile is `None`) adds
+  `--cookies-from-browser <browser>[:<profile>]` after `--no-overwrites`. `App` passes it from the
+  config to `Downloader::start(url, folder, cookies)` when a download starts. No `+KEYRING` or
+  `::CONTAINER`; yt-dlp's errors (no cookie DB, keyring) arrive as its `ERROR:` lines. Settings
+  rows "Cookies from browser:" (combo: Off + `Browser::ALL`, no Safari) and "Profile:" (disabled
+  while Off) in `ui/settings.rs`.
 - It works in a hidden staging folder inside the tab folder (`--paths temp:…/.soundboars-download-*`,
   a `TempDir`), so `.part`/intermediate files never show up as sounds and the finished MP3 arrives
   by rename. Cancel (or dropping `YtDlp`) kills yt-dlp's process group (incl. ffmpeg) and removes

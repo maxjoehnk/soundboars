@@ -1,11 +1,14 @@
 //! Adding sounds from URLs: a [`Downloader`] fetches the audio of a web page (e.g. a YouTube
 //! video) as MP3 into a tab's folder. [`ytdlp::YtDlp`] does it with `yt-dlp` and `ffmpeg`.
 
+pub mod cookies;
 pub mod ytdlp;
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+pub use cookies::{Browser, BrowserCookies};
 
 /// How far a running download is.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,9 +34,9 @@ pub enum DownloadEvent {
 pub trait Downloader: Send {
     /// Why downloads can't work (e.g. missing tools), as checked at startup.
     fn unavailable(&self) -> Option<String>;
-    /// Starts downloading the audio of `url` as MP3 into `folder`, cancelling a running download.
-    /// Partial files never appear in `folder`.
-    fn start(&mut self, url: &str, folder: &Path);
+    /// Starts downloading the audio of `url` as MP3 into `folder`, with the browser's `cookies` if
+    /// given, cancelling a running download. Partial files never appear in `folder`.
+    fn start(&mut self, url: &str, folder: &Path, cookies: Option<&BrowserCookies>);
     /// Stops the running download, if any, and removes its partial files.
     fn cancel(&mut self);
     /// The events since the last call.

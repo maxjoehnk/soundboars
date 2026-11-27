@@ -10,12 +10,13 @@ use crate::app::{Action, AppState, STOP_ALL_ID, Setting};
 use crate::audio::Retrigger;
 use crate::config::Theme;
 use crate::hotkeys::BackendKind;
+use crate::import::{Browser, BrowserCookies};
 
 pub fn dialog(state: &AppState) -> Option<Dialog> {
     state.settings_open.then(|| Dialog {
         view: View::Settings,
         title: "Settings".to_owned(),
-        size: [560.0, 340.0],
+        size: [560.0, 440.0],
         resizable: false,
     })
 }
@@ -30,6 +31,7 @@ pub fn body(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
         .show(ui, |ui| {
             rows(ui, state, actions);
             midi_section::settings_rows(ui, state, actions);
+            cookies_rows(ui, state, actions);
         });
     ui.separator();
     hotkey_settings(ui, state, actions);
@@ -62,6 +64,76 @@ fn rows(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
     if let Some(kind) = choice_row(ui, "Hotkey backend:", backend, backend_options) {
         actions.push(Action::ChangeSetting(Setting::HotkeyBackend(kind)));
     }
+}
+
+const COOKIES_HINT: &str = "yt-dlp reads this browser's cookies to download age-restricted or \
+    members-only videos (log in there first). The profile is a name or a path; without one, \
+    yt-dlp takes the most recently used profile. A path also works for Firefox forks (e.g. \
+    LibreWolf, Zen) and Flatpak or Snap installs of Chromium-based browsers.";
+
+/// The browser (or Off) and profile whose cookies URL imports use.
+fn cookies_rows(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    let current = state.config.settings.cookies_from_browser.as_ref();
+    let caption = ui
+        .label("Cookies from browser:")
+        .on_hover_text(COOKIES_HINT);
+    browser_picker(ui, current, actions)
+        .labelled_by(caption.id)
+        .on_hover_text(COOKIES_HINT);
+    ui.end_row();
+
+    let caption = ui.label("Profile:").on_hover_text(COOKIES_HINT);
+    profile_field(ui, current, actions)
+        .labelled_by(caption.id)
+        .on_hover_text(COOKIES_HINT);
+    ui.end_row();
+}
+
+fn browser_picker(
+    ui: &mut egui::Ui,
+    current: Option<&BrowserCookies>,
+    actions: &mut Vec<Action>,
+) -> egui::Response {
+    let selected = current.map(|cookies| cookies.browser);
+    let profile = current.and_then(|cookies| cookies.profile.clone());
+    let options = std::iter::once(None).chain(Browser::ALL.map(Some));
+    egui::ComboBox::from_id_salt("cookies from browser")
+        .selected_text(selected.map_or("Off", Browser::label))
+        .show_ui(ui, |ui| {
+            for option in options {
+                let label = option.map_or("Off", Browser::label);
+                if ui.selectable_label(selected == option, label).clicked() {
+                    let cookies =
+                        option.map(|browser| BrowserCookies::new(browser, profile.clone()));
+                    actions.push(Action::ChangeSetting(Setting::CookiesFromBrowser(cookies)));
+                }
+            }
+        })
+        .response
+}
+
+/// Disabled while no browser is chosen.
+fn profile_field(
+    ui: &mut egui::Ui,
+    current: Option<&BrowserCookies>,
+    actions: &mut Vec<Action>,
+) -> egui::Response {
+    let mut profile = current
+        .and_then(|cookies| cookies.profile.clone())
+        .unwrap_or_default();
+    let field = egui::TextEdit::singleline(&mut profile)
+        .hint_text("most recently used")
+        .desired_width(260.0);
+    let response = ui.add_enabled(current.is_some(), field);
+    if let Some(cookies) = current
+        && response.changed()
+    {
+        let cookies = BrowserCookies::new(cookies.browser, Some(profile));
+        actions.push(Action::ChangeSetting(Setting::CookiesFromBrowser(Some(
+            cookies,
+        ))));
+    }
+    response
 }
 
 /// A hint on the chosen backend, and the "Stop all" hotkey.

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio::{RecordingApp, Retrigger, Trim};
 use crate::color::{self, TileColor};
 use crate::hotkeys::{self, BackendKind, Hotkey};
+use crate::import::{self, BrowserCookies};
 use crate::midi::{MidiBinding, MidiDevice};
 
 /// Overrides where the config file lives (e.g. for tests).
@@ -47,6 +48,12 @@ pub struct Settings {
     pub midi_input: MidiDevice,
     /// Stops all sounds.
     pub midi_stop_all: Option<MidiBinding>,
+    /// The browser whose cookies URL imports use (e.g. for age-restricted videos).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "import::cookies::deserialize_lenient"
+    )]
+    pub cookies_from_browser: Option<BrowserCookies>,
 }
 
 impl Default for Settings {
@@ -61,6 +68,7 @@ impl Default for Settings {
             stop_all_hotkey: None,
             midi_input: MidiDevice::default(),
             midi_stop_all: None,
+            cookies_from_browser: None,
         }
     }
 }
@@ -456,6 +464,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::Browser;
     use crate::midi::MidiControl;
 
     fn store() -> (tempfile::TempDir, ConfigStore) {
@@ -539,6 +548,10 @@ mod tests {
                     channel: 1,
                     control: MidiControl::ControlChange(20),
                 }),
+                cookies_from_browser: Some(BrowserCookies::new(
+                    Browser::Firefox,
+                    Some("~/.librewolf/abc.default".to_owned()),
+                )),
             },
             target: Some(SavedTarget {
                 process_binary: Some("Discord".to_owned()),
@@ -583,6 +596,13 @@ mod tests {
         assert!(text.contains("note = 36"), "{text}");
         assert!(text.contains("injection = \"app\""), "{text}");
         assert!(
+            text.contains(
+                "[settings.cookies_from_browser]\nbrowser = \"firefox\"\n\
+                 profile = \"~/.librewolf/abc.default\"\n"
+            ),
+            "{text}"
+        );
+        assert!(
             text.contains("[[tabs.sounds.\"airhorn.mp3\".clips]]"),
             "{text}"
         );
@@ -604,6 +624,29 @@ mod tests {
         for key in [ClipKey::new("a#1.wav", 0), ClipKey::new("a.wav", 7)] {
             assert_eq!(ClipKey::from(key.to_string().as_str()), key);
         }
+    }
+
+    #[test]
+    fn cookies_from_browser_are_optional_and_lenient() {
+        let (_dir, store) = store();
+        store.save(&Config::default()).expect("save");
+        let text = fs::read_to_string(store.path()).expect("read");
+        assert!(!text.contains("cookies_from_browser"), "{text}");
+
+        let read = |text: &str| {
+            let config: Config = toml::from_str(text).expect("valid");
+            config.settings.cookies_from_browser
+        };
+        let chrome = "[settings.cookies_from_browser]\nbrowser = \"chrome\"\nprofile = \"\"";
+        assert_eq!(
+            read(chrome),
+            Some(BrowserCookies::new(Browser::Chrome, None))
+        );
+        let unknown = "[settings]\ntheme = \"light\"\n\
+                       [settings.cookies_from_browser]\nbrowser = \"netscape\"";
+        let config: Config = toml::from_str(unknown).expect("an unknown browser is dropped");
+        assert_eq!(config.settings.cookies_from_browser, None);
+        assert_eq!(config.settings.theme, Theme::Light);
     }
 
     #[test]

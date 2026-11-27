@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use soundboars::audio::decode::probe_duration;
 use soundboars::import::ytdlp::YtDlp;
-use soundboars::import::{DownloadEvent, Downloader, Stage};
+use soundboars::import::{Browser, BrowserCookies, DownloadEvent, Downloader, Stage};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -158,7 +158,7 @@ fn downloads_audio_as_mp3_into_the_folder() {
     let folder = tempfile::tempdir().expect("temp dir");
     let mut downloader = downloader();
 
-    downloader.start(&format!("{base}/tone.wav"), folder.path());
+    downloader.start(&format!("{base}/tone.wav"), folder.path(), None);
     let events = run_to_end(&mut downloader);
 
     let mp3: PathBuf = folder.path().join("tone.mp3");
@@ -194,7 +194,7 @@ fn an_existing_file_is_not_overwritten() {
     fs::write(&existing, &mine).expect("write");
     let mut downloader = downloader();
 
-    downloader.start(&format!("{base}/tone.wav"), folder.path());
+    downloader.start(&format!("{base}/tone.wav"), folder.path(), None);
     let events = run_to_end(&mut downloader);
 
     assert_eq!(events.last(), Some(&DownloadEvent::Done(existing.clone())));
@@ -211,7 +211,7 @@ fn a_missing_page_fails_with_a_readable_message() {
     let folder = tempfile::tempdir().expect("temp dir");
     let mut downloader = downloader();
 
-    downloader.start(&format!("{base}/gone.wav"), folder.path());
+    downloader.start(&format!("{base}/gone.wav"), folder.path(), None);
     let events = run_to_end(&mut downloader);
 
     let Some(DownloadEvent::Failed(message)) = events.last() else {
@@ -219,6 +219,29 @@ fn a_missing_page_fails_with_a_readable_message() {
     };
     assert!(message.contains("HTTP Error 404"), "{message}");
     assert!(!message.contains("ERROR:"), "{message}");
+    assert!(files_in(folder.path()).is_empty());
+}
+
+#[test]
+fn a_browser_profile_without_cookies_fails_with_a_readable_message() {
+    if !common::pipewire_required() {
+        return;
+    }
+    let base = serve(wav(0.5), None);
+    let folder = tempfile::tempdir().expect("temp dir");
+    let profile = tempfile::tempdir().expect("temp dir");
+    let profile = profile.path().to_str().expect("UTF-8").to_owned();
+    let cookies = BrowserCookies::new(Browser::Firefox, Some(profile.clone()));
+    let mut downloader = downloader();
+
+    downloader.start(&format!("{base}/tone.wav"), folder.path(), Some(&cookies));
+    let events = run_to_end(&mut downloader);
+
+    let Some(DownloadEvent::Failed(message)) = events.last() else {
+        panic!("{events:?}");
+    };
+    let expected = format!("could not find firefox cookies database in '{profile}'");
+    assert_eq!(message, &expected);
     assert!(files_in(folder.path()).is_empty());
 }
 
@@ -233,7 +256,7 @@ fn cancelling_stops_the_download_and_leaves_no_files() {
     let mut downloader = downloader();
 
     let url = format!("{base}/tone.wav");
-    downloader.start(&url, folder.path());
+    downloader.start(&url, folder.path(), None);
     let deadline = Instant::now() + TIMEOUT;
     while !downloader
         .poll()
