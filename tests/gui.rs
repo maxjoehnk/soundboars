@@ -1026,6 +1026,21 @@ fn airhorn_clip(setup: &Setup, clip: u32, start_ms: u64) -> Call {
 }
 
 #[test]
+fn a_duplicate_that_is_never_saved_goes_away_again() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    let original = saved_airhorn(&setup);
+
+    tile_menu(&mut harness, "Airhorn", "Duplicate");
+    assert!(harness.query_by_label(&tile("Airhorn (2)")).is_some());
+    click_editor_button(&mut harness, "Cancel");
+
+    assert!(harness.query_by_label(EDITOR).is_none());
+    assert!(harness.query_by_label(&tile("Airhorn (2)")).is_none());
+    assert_eq!(saved_airhorn(&setup), original);
+}
+
+#[test]
 fn a_duplicated_clip_is_trimmed_on_its_own_and_plays_its_own_part() {
     let setup = Setup::new();
     let mut harness = setup.start();

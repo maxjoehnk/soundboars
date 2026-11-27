@@ -464,15 +464,15 @@ impl App {
     }
 
     /// Adds a copy of the clip and opens it in the editor with its name field focused, for
-    /// renaming and trimming.
+    /// renaming and trimming. The copy stays only if the editor is saved.
     fn duplicate_clip(&mut self, clip: &ClipId) {
         let Some(copy) = self.state.duplicate_clip(clip) else {
             return;
         };
-        self.unsaved = true;
         self.edit_sound(&copy);
         if let Some(editor) = &mut self.state.editor {
             editor.focus_name = true;
+            editor.unsaved_copy = true;
         }
     }
 
@@ -553,14 +553,23 @@ impl App {
             editor.apply_to(config);
             self.unsaved = true;
         }
+        if let Some(editor) = &mut self.state.editor {
+            // Saved, so the duplicate stays.
+            editor.unsaved_copy = false;
+        }
         self.close_editor();
     }
 
-    /// Closes the editor, if open, discarding unsaved changes and stopping its preview.
+    /// Closes the editor, if open, discarding unsaved changes (and a duplicate that was never
+    /// saved) and stopping its preview.
     fn close_editor(&mut self) {
         self.state.midi.stop_learning(LearnTarget::Sound);
-        if self.state.editor.take().is_some() {
-            self.with_audio(|audio| audio.stop_preview());
+        let Some(editor) = self.state.editor.take() else {
+            return;
+        };
+        self.with_audio(|audio| audio.stop_preview());
+        if editor.unsaved_copy {
+            self.state.delete_clip(&editor.clip);
         }
     }
 

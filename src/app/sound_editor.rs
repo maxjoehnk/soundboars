@@ -78,6 +78,9 @@ pub struct SoundEditor {
     pub name: String,
     /// The name field should take the keyboard focus (the editor was opened for a new duplicate).
     pub focus_name: bool,
+    /// The clip is a new duplicate that only stays once it's saved: closing the editor without
+    /// saving removes it again.
+    pub unsaved_copy: bool,
     pub volume: f32,
     pub start_ms: u64,
     /// `None` plays to the end. Once the waveform (and so the length) is known, this is always set.
@@ -113,6 +116,7 @@ impl SoundEditor {
             file_name,
             name,
             focus_name: false,
+            unsaved_copy: false,
             volume: saved.volume,
             start_ms: saved.start_ms,
             end_ms: saved.end_ms,
