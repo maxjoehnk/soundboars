@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use pipewire as pw;
 use pw::context::ContextRc;
@@ -13,6 +14,7 @@ use pw::link::Link;
 use pw::main_loop::MainLoopRc;
 use pw::metadata::{Metadata, MetadataListener};
 use pw::node::{Node, NodeChangeMask, NodeListener};
+use pw::properties::PropertiesBox;
 use pw::proxy::{ProxyListener, ProxyT};
 use pw::registry::{GlobalObject, RegistryRc};
 use pw::spa::utils::dict::DictRef;
@@ -22,7 +24,7 @@ use pw::types::ObjectType;
 use super::AudioError;
 use super::graph::{
     DEFAULT_SOURCE_KEY, Direction, Graph, LinkProps, NodeProps, PortProps, RECORDING_STREAM_CLASS,
-    RecordingApp, SOURCE_CLASSES, parse_default_node,
+    RecordingApp, SOURCE_CLASSES, may_lose_metadata_updates, parse_default_node,
 };
 use super::link_plan::{NodeLink, choose_microphone, plan_links, plan_virtual_mic};
 use super::output::{INJECT, LOCAL, OutputStream, Render};
@@ -166,7 +168,7 @@ impl Session {
         let state = Rc::new_cyclic(|this| RefCell::new(State::new(core.clone(), events, this)));
         Ok(Self {
             _registry_listener: watch_registry(&registry, &state),
-            _core_listener: report_core_errors(&core, &state),
+            _core_listener: watch_core(&core, &state),
             _inject_listener: watch_stream(&inject, &state, State::set_inject_node)?,
             _local_listener: watch_stream(&local, &state, |_, _| {})?,
             state,
@@ -185,6 +187,14 @@ impl Session {
             Command::SetTarget(target) => state.borrow_mut().set_target(target),
             Command::Quit => main_loop.quit(),
         });
+        let state = Rc::clone(&self.state);
+        let refresh = self.main_loop.loop_().add_timer(move |_| {
+            state.borrow_mut().refresh_default_metadata();
+        });
+        // Fails only for an invalid timer, which `add_timer` just created.
+        let _ = refresh
+            .update_timer(Some(METADATA_REFRESH), Some(METADATA_REFRESH))
+            .into_result();
         self.main_loop.run();
     }
 }
@@ -242,15 +252,41 @@ fn watch_default_metadata(
     registry: &RegistryRc,
     global: &GlobalObject<&DictRef>,
 ) {
-    let metadata: Metadata = match registry.bind(global) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return state
-                .borrow()
-                .report(format!("binding metadata {}: {error}", global.id));
+    let global = global.to_owned();
+    match bind_default_metadata(Rc::downgrade(state), registry, &global) {
+        Ok(binding) => {
+            state.borrow_mut().default_metadata = Some(DefaultMetadata {
+                global,
+                registry: registry.clone(),
+                binding,
+            });
         }
-    };
-    let weak_state: Weak<RefCell<State>> = Rc::downgrade(state);
+        Err(error) => state.borrow().report(error),
+    }
+}
+
+/// How often the default metadata is bound again where PipeWire may lose its updates
+/// ([`may_lose_metadata_updates`]).
+const METADATA_REFRESH: Duration = Duration::from_secs(2);
+
+/// The bound `default` metadata, and what it takes to bind it again.
+struct DefaultMetadata {
+    global: GlobalObject<PropertiesBox>,
+    registry: RegistryRc,
+    binding: (Metadata, MetadataListener),
+}
+
+/// Binds the `default` metadata; its listener tells `state` the default source. A new binding
+/// first gets every current property.
+fn bind_default_metadata(
+    state: Weak<RefCell<State>>,
+    registry: &RegistryRc,
+    global: &GlobalObject<PropertiesBox>,
+) -> Result<(Metadata, MetadataListener), String> {
+    let metadata: Metadata = registry
+        .bind(global)
+        .map_err(|error| format!("binding metadata {}: {error}", global.id))?;
+    let weak_state = state;
     let listener = metadata
         .add_listener_local()
         .property(move |subject, key, _type, value| {
@@ -265,7 +301,7 @@ fn watch_default_metadata(
             0
         })
         .register();
-    state.borrow_mut().default_metadata = Some((global.id, metadata, listener));
+    Ok((metadata, listener))
 }
 
 /// Registry globals only carry a few node properties; the app name, binary, media name and
@@ -299,9 +335,16 @@ fn watch_node(state: &Rc<RefCell<State>>, registry: &RegistryRc, global: &Global
         .insert(global.id, (node, listener));
 }
 
-fn report_core_errors(core: &CoreRc, state: &Rc<RefCell<State>>) -> pw::core::Listener {
+/// Reports core errors and notes the server's version.
+fn watch_core(core: &CoreRc, state: &Rc<RefCell<State>>) -> pw::core::Listener {
+    let for_info = Rc::downgrade(state);
     let state = Rc::downgrade(state);
     core.add_listener_local()
+        .info(move |info| {
+            if let Some(state) = for_info.upgrade() {
+                state.borrow_mut().refresh_metadata = may_lose_metadata_updates(info.version());
+            }
+        })
         .error(move |id, _seq, res, message| {
             if let Some(state) = state.upgrade() {
                 state
@@ -355,7 +398,10 @@ struct State {
     events: EventSink,
     graph: Graph,
     watched_nodes: HashMap<u32, (Node, NodeListener)>,
-    default_metadata: Option<(u32, Metadata, MetadataListener)>,
+    default_metadata: Option<DefaultMetadata>,
+    /// The server may stop sending metadata changes, so the default metadata is bound again now and
+    /// then ([`may_lose_metadata_updates`]).
+    refresh_metadata: bool,
     /// The `node.name` of the default source.
     default_source: Option<String>,
     published_apps: Vec<RecordingApp>,
@@ -378,6 +424,7 @@ impl State {
             graph: Graph::default(),
             watched_nodes: HashMap::new(),
             default_metadata: None,
+            refresh_metadata: false,
             default_source: None,
             published_apps: Vec::new(),
             published_microphone: None,
@@ -410,12 +457,29 @@ impl State {
         if self
             .default_metadata
             .as_ref()
-            .is_some_and(|(metadata_id, ..)| *metadata_id == id)
+            .is_some_and(|metadata| metadata.global.id == id)
         {
             self.default_metadata = None;
             self.default_source = None;
         }
         self.graph_changed();
+    }
+
+    /// Binds the default metadata again to re-read the default source, where the server may have
+    /// stopped sending its changes; only the virtual mic follows the default source.
+    fn refresh_default_metadata(&mut self) {
+        if !self.refresh_metadata || self.target != Target::VirtualMic {
+            return;
+        }
+        let Some(metadata) = &mut self.default_metadata else {
+            return;
+        };
+        let state = Weak::clone(&self.this);
+        match bind_default_metadata(state, &metadata.registry, &metadata.global) {
+            // The old binding goes away only now, long after its own ping came back.
+            Ok(binding) => metadata.binding = binding,
+            Err(error) => self.report(error),
+        }
     }
 
     fn set_default_source(&mut self, name: Option<String>) {

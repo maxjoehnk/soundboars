@@ -175,6 +175,8 @@ impl Recorders {
         engine.link_to(target.node_id);
         wait_for_links(INJECT_NODE_NAME, |links| links.len() == 2);
         wait_for_links(HEADLESS_SINK, |links| links.len() >= 2);
+        app.wait_until_receiving();
+        local.wait_until_receiving();
         Self { app, local }
     }
 

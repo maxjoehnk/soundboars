@@ -145,6 +145,18 @@ pub fn parse_default_node(json: &str) -> Option<String> {
         .map(|node| node.name)
 }
 
+/// Whether a PipeWire server of `version` (`1.4.2`) may stop telling clients about metadata
+/// changes: before 1.6.9, a client that bound the metadata and left before the server's ping to its
+/// owner came back leaked a counter, and from then on no bound client got property changes
+/// (PipeWire #5445). An unreadable version counts as affected.
+pub fn may_lose_metadata_updates(version: &str) -> bool {
+    let mut numbers = version
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().ok());
+    let parsed = (|| Some((numbers.next()??, numbers.next()??, numbers.next()??)))();
+    parsed.is_none_or(|version| version < (1, 6, 9))
+}
+
 #[derive(Debug, Default)]
 pub struct Graph {
     nodes: BTreeMap<u32, NodeProps>,
@@ -458,5 +470,15 @@ mod tests {
         );
         assert_eq!(parse_default_node("{}"), None);
         assert_eq!(parse_default_node("not json"), None);
+    }
+
+    #[test]
+    fn pipewire_before_1_6_9_may_lose_metadata_updates() {
+        for version in ["1.4.2", "1.6.8", "0.3.80", "garbage", ""] {
+            assert!(may_lose_metadata_updates(version), "{version}");
+        }
+        for version in ["1.6.9", "1.6.12", "1.7.0", "2.0.0"] {
+            assert!(!may_lose_metadata_updates(version), "{version}");
+        }
     }
 }

@@ -55,6 +55,8 @@ a chosen app's recording stream.
   `WAYLAND_DISPLAY` unset and a private Xvfb/PipeWire).
 - Tests that need `/dev/snd/seq` (MIDI) must skip cleanly when it doesn't exist (CI runners).
 - Tests must not need network access (serve yt-dlp test media from a local HTTP server).
+- Recorders (`tests/common::Recorder`, `pw-record`) need a moment after being linked before audio
+  flows; call `wait_until_receiving()` before playing anything short.
 - Manual verification against real apps (Discord etc.) is done by the user.
 
 ## Running checks and tests
@@ -92,6 +94,12 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   `priority.session`, never `soundboars-mic` itself). `link_plan::plan_virtual_mic` always links
   inject → virtual mic and the mic → virtual mic only while the virtual mic has consumers
   (`Graph::has_consumers`; a pavucontrol level meter counts too).
+  PipeWire < 1.6.9 can silently stop sending metadata changes to every bound client (a client that
+  binds and leaves before the owner's pong leaks `pending` in module-metadata, PipeWire #5445,
+  fixed by commit 06de0ed2/b784720b); short-lived `pw-metadata`/`wpctl` calls trigger it. On such
+  servers (`graph::may_lose_metadata_updates`, version from the core info) the service re-binds the
+  `default` metadata every 2 s while the virtual mic is the target (a new binding always gets the
+  current values). The CI container has 1.4.2, so `tests/virtual_mic.rs` exercises this path.
   Each render closure is a `mixer::Mixer` on PipeWire's data thread: commands arrive via an `rtrb`
   ring; ended voices go back (with their `Arc<[f32]>`, so the last `Arc` is never dropped on the RT
   thread) via a second ring. Call volume is applied after the limiter and halved for targets that

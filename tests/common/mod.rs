@@ -91,6 +91,24 @@ impl Recorder {
         }
     }
 
+    /// Waits until audio (even silence) arrives, so nothing played afterwards is missed: a stream
+    /// that was just linked can take a moment to start, longer on a busy machine.
+    pub fn wait_until_receiving(&self) {
+        // 8 KiB is about 10 ms of stereo f32 at 48 kHz.
+        const GROWTH: u64 = 8 * 1024;
+        let size = || std::fs::metadata(&self.wav).map_or(0, |metadata| metadata.len());
+        let start = size();
+        let deadline = Instant::now() + TIMEOUT;
+        while size() < start + GROWTH {
+            assert!(
+                Instant::now() < deadline,
+                "{} receives no audio",
+                self.wav.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Stops recording cleanly (SIGINT, so the WAV gets flushed) and returns the left channel.
     pub fn stop_and_read(self) -> Vec<f32> {
         self.stop_and_read_stereo().0

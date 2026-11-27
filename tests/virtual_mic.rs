@@ -154,15 +154,36 @@ fn assert_virtual_mic_node() {
 
 fn wait_for_microphone(events: &mpsc::Receiver<Event>, description: &str) {
     let deadline = Instant::now() + TIMEOUT;
+    let mut seen = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match events.recv_timeout(remaining) {
             Ok(Event::Microphone(Some(microphone))) if microphone == description => return,
             Ok(Event::Error(message)) => panic!("PipeWire error: {message}"),
+            Ok(Event::Microphone(other)) => seen.push(format!("Microphone({other:?})")),
             Ok(_) => {}
-            Err(_) => panic!("{description} did not become the microphone"),
+            Err(_) => panic!(
+                "{description} did not become the microphone; microphone events: {seen:?}\n{}",
+                diagnostics()
+            ),
         }
     }
+}
+
+/// The default-node metadata and the sources, for failure messages.
+fn diagnostics() -> String {
+    let run = |program: &str, args: &[&str]| {
+        Command::new(program)
+            .args(args)
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_else(|error| format!("{program}: {error}"))
+    };
+    format!(
+        "pw-metadata:\n{}\nwpctl status:\n{}",
+        run("pw-metadata", &["0"]),
+        run("wpctl", &["status"])
+    )
 }
 
 /// Makes the node named `name` the configured default source, like a desktop's sound settings do
