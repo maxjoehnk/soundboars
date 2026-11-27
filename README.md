@@ -1,15 +1,21 @@
 # SoundBoars
 
-A soundboard for Linux. It plays sounds on your speakers **and** injects them into a voice-chat
-app of your choice (Discord, Mumble, a browser call, …) through PipeWire, without touching that
-app's real microphone.
+A soundboard for Linux. It plays sounds on your speakers **and** into your voice chats (Discord,
+Teams, Mumble, a browser call, …) through PipeWire: pick "SoundBoars Microphone" as the input
+device in the call app and it carries your real microphone plus the sounds.
 
 ## Features
 
 - Folders as tabs: add a folder and its sounds show up as tiles; changes on disk appear live.
-- Inject into any app that records audio; the chosen app is remembered and relinked when it
-  restarts. Separate volumes for the call and local playback; local playback can be turned off.
+- A virtual microphone, "SoundBoars Microphone", that mixes your default microphone (it follows
+  changes of the default) with the sounds. Your real microphone is only opened while an app
+  records the virtual one. Alternatively (the "Inject into" picker) sounds can be linked straight
+  into one app's recording stream; that app is remembered and relinked when it restarts.
+- Separate volumes for the call and local playback; local playback can be turned off.
 - Non-destructive trimming with a waveform editor, per-sound volume, preview.
+- Tiles you can rename, color and drag into your own order; the files on disk stay untouched.
+- Duplicate a sound to use different parts of one file as separate clips, each with its own
+  name, trim, volume, color, hotkey and MIDI binding.
 - Global hotkeys (XDG GlobalShortcuts portal or X11) and MIDI controllers (learn mode, hotplug).
   Both work while the window is hidden or on another workspace.
 - "Stop all" button, hotkey and MIDI binding.
@@ -27,6 +33,13 @@ Build dependencies (Debian/Ubuntu names): a Rust toolchain, `pkg-config`, `clang
 `libclang-dev`, `libpipewire-0.3-dev`, `libspa-0.2-dev`, `libasound2-dev`, `libxkbcommon-dev`,
 `libwayland-dev`, X11 headers (`libx11-dev`, `libxi-dev`, `libxtst-dev`). `ci/Dockerfile` has the
 full list.
+
+## Using it in calls
+
+Start SoundBoars, then select **SoundBoars Microphone** as the microphone/input device in your call
+app. The device exists only while SoundBoars runs. The label next to "Inject into" shows which real
+microphone is mixed in. If sounds get filtered out, turn off the call app's noise suppression
+(e.g. Krisp in Discord).
 
 ## Build and run
 
@@ -65,21 +78,21 @@ hl.bind("CTRL + F12", hl.dsp.global("me.maxjoehnk.soundboars:stop-all"))
 
 Older hyprlang configs: `bind = CTRL, F13, global, me.maxjoehnk.soundboars:play-airhorn`.
 
-Dialogs (Settings, Edit sound, Add sound from URL) open as their own windows; to float them
-instead of tiling:
+Dialogs open as their own windows. Settings, Rename sound and Add sound from URL have a fixed size,
+which Hyprland floats on its own. "Edit sound" can be resized; to float it as well:
 
 ```lua
 hl.window_rule({
   match = {
     class = [[^me\.maxjoehnk\.soundboars$]],
-    title = [[^(Settings|Edit sound.*|Add sound from URL)$]],
+    title = [[^Edit sound.*$]],
   },
   float = true,
 })
 ```
 
 Hyprland 0.53–0.54 (hyprlang):
-`windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Settings|Edit sound.*|Add sound from URL)$, float on`
+`windowrule = match:class ^(me\.maxjoehnk\.soundboars)$, match:title ^(Edit sound.*)$, float on`
 
 ## Development
 

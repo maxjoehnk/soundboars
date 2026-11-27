@@ -40,10 +40,19 @@ impl Dialog {
         if let Some(icon) = icon() {
             builder = builder.with_icon(icon);
         }
+        let scrolls = !self.resizable;
         ctx.show_viewport_deferred(self.viewport_id(), builder, move |ui, class| match class {
             ViewportClass::EmbeddedWindow => contents(ui),
             _ => {
-                egui::CentralPanel::default().show(ui, |ui| contents(ui));
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // Content that doesn't fit a fixed size (e.g. a long error) scrolls instead
+                    // of being cut off.
+                    if scrolls {
+                        egui::ScrollArea::vertical().show(ui, |ui| contents(ui));
+                    } else {
+                        contents(ui);
+                    }
+                });
             }
         });
     }
