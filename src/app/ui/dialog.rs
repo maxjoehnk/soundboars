@@ -16,6 +16,9 @@ pub struct Dialog {
     pub title: String,
     /// Inner size in points when it opens.
     pub size: [f32; 2],
+    /// Whether the user can resize the window. A fixed size makes tiling compositors (Hyprland,
+    /// sway) float it: winit doesn't tell them it's a dialog of the main window on Wayland.
+    pub resizable: bool,
 }
 
 impl Dialog {
@@ -32,7 +35,8 @@ impl Dialog {
         let mut builder = ViewportBuilder::default()
             .with_title(&self.title)
             .with_app_id(APP_ID)
-            .with_inner_size(self.size);
+            .with_inner_size(self.size)
+            .with_resizable(self.resizable);
         if let Some(icon) = icon() {
             builder = builder.with_icon(icon);
         }

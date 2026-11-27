@@ -13,6 +13,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
         view: View::UrlImport,
         title: "Add sound from URL".to_owned(),
         size: [480.0, 200.0],
+        resizable: true,
     })
 }
 

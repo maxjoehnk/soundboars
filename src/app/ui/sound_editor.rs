@@ -21,6 +21,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
         view: View::SoundEditor,
         title: format!("Edit sound – {}", editor.file_name),
         size: [680.0, 420.0],
+        resizable: true,
     })
 }
 

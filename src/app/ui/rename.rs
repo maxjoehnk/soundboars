@@ -12,6 +12,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
         view: View::Rename,
         title: "Rename sound".to_owned(),
         size: [360.0, 110.0],
+        resizable: false,
     })
 }
 

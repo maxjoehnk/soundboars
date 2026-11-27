@@ -16,6 +16,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
         view: View::Settings,
         title: "Settings".to_owned(),
         size: [560.0, 340.0],
+        resizable: true,
     })
 }
 
