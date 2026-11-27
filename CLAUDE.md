@@ -13,7 +13,7 @@ a chosen app's recording stream.
 
 | Area | Decision |
 |---|---|
-| GUI | `eframe`/`egui` 0.37, default look. Dialogs are separate OS windows (deferred viewports); eframe is vendored with one patch (`vendor/README.md`). |
+| GUI | `eframe`/`egui` 0.37, egui's default colors and widgets with more room (`app/ui/style.rs`); no custom design system. Dialogs are separate OS windows (deferred viewports); eframe is vendored with one patch (`vendor/README.md`). |
 | Injection | Two modes (`Config::injection`). **Virtual mic** (default): a `support.null-audio-sink` adapter node `soundboars-mic` ("SoundBoars Microphone", `Audio/Source/Virtual`, FL/FR) that call apps pick as their input; `soundboars-inject` and the default source (the user's mic, followed via the `default` metadata) are linked into it with `link-factory`, the mic only while something records the virtual mic. **App** (Soundux-style "pick an app"): `soundboars-inject` (`Stream/Output/Audio`, no autoconnect) is linked straight to the target app's `Stream/Input/Audio` ports; the app's real mic link (WirePlumber) stays untouched. The app target is remembered as `(application.process.binary, application.name)` and auto-relinked when the node reappears. The app-linking mode proved unstable with some apps (lost links, teams-for-linux), hence the virtual mic. |
 | Local playback | Separate stream `soundboars-local`, autoconnected to the default sink. Each stream mixes independently over shared decoded `Arc<[f32]>` buffers (no cross-clock mixing). |
 | Hotkeys | `trait HotkeyBackend` with two impls: XDG GlobalShortcuts portal (`ashpd`) and X11 (`global-hotkey`, X11-only; won't fire on Wayland-native focus). Backends report capabilities (e.g. Hyprland's portal ignores `preferred_trigger` → UI shows the Hyprland config bind line instead of a record button). |
@@ -23,6 +23,7 @@ a chosen app's recording stream.
 | URL import | Spawn `yt-dlp -x --audio-format mp3 …` into the chosen tab folder (via a hidden staging folder), parse progress, then open "Edit sound" (trim editor). |
 | Decoding | `symphonia` (no Opus decoder in 0.6!), resample with `rubato` to 48 kHz stereo f32. |
 | Config | `serde` + `toml` in `$XDG_CONFIG_HOME/soundboars/config.toml` (`directories` crate). |
+| Sharing (planned, milestone 9) | Self-hosted `soundboars-hub` in this repo (cargo workspace: app, hub, shared API types crate). axum + SQLite, blobs on a PVC addressed by sha256 (deduplicated; several shared sounds may point to one blob). Single replica on k3s. No users: API keys `sbk_<id>_<secret>` (only the hash is stored), created/listed/revoked with the hub's CLI via `kubectl exec`, with no admin HTTP API. The **original file** is uploaded with name, volume, trim and tags. Color, hotkey and MIDI stay local. Uploaders can delete their own sounds. The app stores the API key in the Secret Service keychain, never in `config.toml`. |
 
 ## Code style
 
@@ -155,6 +156,13 @@ scripts/in-container.sh scripts/test-headless.sh run cargo run --example play   
   editor; it stays only if the editor is saved (`SoundEditor::unsaved_copy`). "Delete clip" exists
   only for extra clips. A clip's display name is its `name`, else the file stem (extra clips:
   `"<stem> (<id+1>)"`); search matches display names and file stems.
+- Look (`ui/style.rs`, applied to both themes in `App::new`): egui's default visuals plus more
+  spacing (item spacing 10×8, button padding 10×5, 26 px widgets, 13.5 px body text, 3 px corners),
+  text fields a step lighter than egui's near-black (`text_edit_bg_color`, also the waveform
+  background) with a faint resting outline (`widgets.inactive.bg_stroke` = the button fill in dark
+  mode, so buttons don't change there), brighter labels. Panels use `style::bar_frame` /
+  `style::content_frame` (12 px margins). egui 0.37's per-widget `StyleProvider`s need its
+  `experimental` feature, so styling stays on `Style`/`Visuals`.
 - Board (`ui/board.rs`): hand-painted 180×90 tiles in equal columns (no `egui::Grid`/`Button`):
   the name centered at the largest of 20/17/14/12 px that fits (≤ 3 rows, then "…"), a dim footer
   with `AppState::length_label` left and `trigger_label` right, the progress bar at the bottom.
@@ -310,3 +318,4 @@ Hyprland 0.53–0.54 (hyprlang): `windowrule = match:class ^(me\.maxjoehnk\.soun
 | 6 | Trim editor: waveform peaks, non-destructive trim, preview | done |
 | 7 | URL import: yt-dlp runner, progress, errors → trim editor | done |
 | 8 | Polish: tray, multi-target, Opus, export trimmed copy | later |
+| 9 | Sound sharing: `soundboars-hub` server (axum + SQLite, k3s), API keys via its CLI, browse/preview/add/upload/delete in the app | planned |

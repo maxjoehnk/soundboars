@@ -5,21 +5,23 @@ use eframe::egui;
 use crate::app::{Action, AppState, Setting};
 
 pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
-    egui::Panel::bottom("bottom").show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let stop = egui::Button::new("⏹ Stop all");
-            if ui.add_enabled(!state.playing.is_empty(), stop).clicked() {
-                actions.push(Action::StopAll);
-            }
-            ui.separator();
-            now_playing(ui, state);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                volumes(ui, state, actions);
+    egui::Panel::bottom("bottom")
+        .frame(super::style::bar_frame(ui.style()))
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let stop = egui::Button::new("⏹ Stop all");
+                if ui.add_enabled(!state.playing.is_empty(), stop).clicked() {
+                    actions.push(Action::StopAll);
+                }
+                ui.separator();
+                now_playing(ui, state);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    volumes(ui, state, actions);
+                });
             });
+            ui.add_space(4.0);
         });
-        ui.add_space(4.0);
-    });
 }
 
 fn now_playing(ui: &mut egui::Ui, state: &AppState) {

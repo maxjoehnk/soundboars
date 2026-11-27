@@ -11,7 +11,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
     state.rename.as_ref().map(|_| Dialog {
         view: View::Rename,
         title: "Rename sound".to_owned(),
-        size: [360.0, 110.0],
+        size: [360.0, 150.0],
         resizable: false,
     })
 }

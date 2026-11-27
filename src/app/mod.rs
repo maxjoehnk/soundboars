@@ -180,6 +180,7 @@ impl App {
     /// engine and starts handling hotkeys and MIDI. Background threads wake `ctx` when there is
     /// something new to show.
     pub fn new(services: Services, ctx: &egui::Context) -> Self {
+        ui::style::apply(ctx);
         let (config, config_error) = services.config.load();
         let mut state = AppState::new(config);
         state.url_import_unavailable = services.downloader.unavailable();

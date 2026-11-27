@@ -44,7 +44,8 @@ impl Dialog {
         ctx.show_viewport_deferred(self.viewport_id(), builder, move |ui, class| match class {
             ViewportClass::EmbeddedWindow => contents(ui),
             _ => {
-                egui::CentralPanel::default().show(ui, |ui| {
+                let frame = super::style::content_frame(ui.style());
+                egui::CentralPanel::default().frame(frame).show(ui, |ui| {
                     // Content that doesn't fit a fixed size (e.g. a long error) scrolls instead
                     // of being cut off.
                     if scrolls {

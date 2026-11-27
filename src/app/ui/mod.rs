@@ -8,6 +8,7 @@ mod midi_section;
 mod rename;
 mod settings;
 mod sound_editor;
+pub mod style;
 mod tile_color;
 mod top_bar;
 mod url_import;
@@ -58,7 +59,9 @@ fn main_window(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
     top_bar::show(ui, state, actions);
     error_bar(ui, state, actions);
     bottom_bar::show(ui, state, actions);
-    egui::CentralPanel::default().show(ui, |ui| board::show(ui, state, actions));
+    egui::CentralPanel::default()
+        .frame(style::content_frame(ui.style()))
+        .show(ui, |ui| board::show(ui, state, actions));
 }
 
 fn error_bar(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {

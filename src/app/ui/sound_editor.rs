@@ -20,7 +20,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
     state.editor.as_ref().map(|editor| Dialog {
         view: View::SoundEditor,
         title: format!("Edit sound – {}", editor.file_name),
-        size: [680.0, 420.0],
+        size: [680.0, 460.0],
         resizable: true,
     })
 }
@@ -93,7 +93,7 @@ fn trim_section(
 fn placeholder(ui: &mut egui::Ui, size: Vec2, message: &str, color: Option<Color32>) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter()
-        .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+        .rect_filled(rect, 4.0, ui.visuals().text_edit_bg_color());
     let mut text = egui::RichText::new(message);
     if let Some(color) = color {
         text = text.color(color);
@@ -125,7 +125,7 @@ fn waveform_view(
 
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
-    painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
+    painter.rect_filled(rect, 4.0, visuals.text_edit_bg_color());
     draw_peaks(&painter, rect, waveform, start..=end, visuals);
     let shade = Color32::from_black_alpha(90);
     painter.rect_filled(

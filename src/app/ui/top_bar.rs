@@ -7,28 +7,30 @@ use crate::app::{Action, AppState};
 use crate::config::Injection;
 
 pub fn show(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
-    egui::Panel::top("top").show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.heading("SoundBoars");
-            ui.separator();
-            target_picker(ui, state, actions);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙ Settings").clicked() {
-                    actions.push(Action::ShowSettings(true));
-                }
-                url_import_button(ui, state, actions);
+    egui::Panel::top("top")
+        .frame(super::style::bar_frame(ui.style()))
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("SoundBoars");
+                ui.separator();
+                target_picker(ui, state, actions);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ Settings").clicked() {
+                        actions.push(Action::ShowSettings(true));
+                    }
+                    url_import_button(ui, state, actions);
+                });
             });
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            tabs(ui, state, actions);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                search(ui, state, actions);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                tabs(ui, state, actions);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    search(ui, state, actions);
+                });
             });
+            ui.add_space(4.0);
         });
-        ui.add_space(4.0);
-    });
 }
 
 /// Disabled, with the reason as tooltip, when yt-dlp or ffmpeg are missing.
