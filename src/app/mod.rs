@@ -828,6 +828,11 @@ impl AppWindows {
     pub fn new(app: App) -> Self {
         Self(Arc::new(Mutex::new(app)))
     }
+
+    /// The app between passes, e.g. for tests that wait for background work.
+    pub fn lock(&self) -> MutexGuard<'_, App> {
+        lock(&self.0)
+    }
 }
 
 /// Closes the OS window of the dialog `view` when it was drawn in a pass of its own and isn't open

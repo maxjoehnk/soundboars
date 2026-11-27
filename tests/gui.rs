@@ -363,7 +363,30 @@ impl Setup {
             .with_size([1000.0, 700.0])
             .build_eframe(|cc| AppWindows::new(App::new(services, &cc.egui_ctx)));
         harness.run();
+        self.wait_for_midi(&mut harness);
         harness
+    }
+
+    /// Waits until the MIDI service (a thread of its own) has listed the ports and connected the
+    /// configured input. Its events would otherwise wake the app in the middle of a test, at a time
+    /// that depends on how busy the machine is.
+    fn wait_for_midi(&self, harness: &mut Harness<'static, AppWindows>) {
+        let listens = self.config().settings.midi_input != MidiDevice::Off;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ready = {
+                let app = harness.state().lock();
+                let midi = &app.state().midi;
+                !midi.ports.is_empty() && (!listens || !midi.connected.is_empty())
+            };
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the MIDI service never reported");
+            std::thread::sleep(Duration::from_millis(5));
+            harness.step();
+        }
+        harness.run();
     }
 }
 
