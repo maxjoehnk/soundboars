@@ -8,9 +8,11 @@ use super::View;
 use super::dialog::{Dialog, close_requested};
 use super::hotkey_section::hotkey_section;
 use super::midi_section::midi_section;
+use super::tile_color;
 use crate::app::sound_editor::{self, EditorAction, SoundEditor, WaveformState};
 use crate::app::{Action, AppState, format_duration};
 use crate::audio::Waveform;
+use crate::color::TileColor;
 
 const WAVEFORM_HEIGHT: f32 = 120.0;
 
@@ -18,7 +20,7 @@ pub fn dialog(state: &AppState) -> Option<Dialog> {
     state.editor.as_ref().map(|editor| Dialog {
         view: View::SoundEditor,
         title: format!("Edit sound – {}", editor.file_name),
-        size: [680.0, 390.0],
+        size: [680.0, 420.0],
     })
 }
 
@@ -37,6 +39,7 @@ fn sections(ui: &mut egui::Ui, state: &AppState, editor: &SoundEditor, actions: 
     name_section(ui, editor, actions);
     trim_section(ui, state, editor, actions);
     volume_section(ui, editor, actions);
+    color_section(ui, editor, actions);
     hotkey_section(ui, state, editor, actions);
     midi_section(ui, state, editor, actions);
     ui.separator();
@@ -268,6 +271,25 @@ fn volume_section(ui: &mut egui::Ui, editor: &SoundEditor, actions: &mut Vec<Act
             .fixed_decimals(0);
         if ui.add(slider).labelled_by(caption.id).changed() {
             actions.push(Action::Editor(EditorAction::Volume(percent / 100.0)));
+        }
+    });
+}
+
+/// The tile's color: a preset, none, or a custom one from the color button.
+fn color_section(ui: &mut egui::Ui, editor: &SoundEditor, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.label("Color:");
+        if let Some(color) = tile_color::swatches(ui, editor.color) {
+            actions.push(Action::Editor(EditorAction::Color(color)));
+        }
+        let mut rgb = tile_color::custom_start(editor.color, ui.visuals());
+        let button = ui
+            .color_edit_button_srgb(&mut rgb)
+            .accessible_name("Custom color")
+            .on_hover_text("Custom color");
+        if button.changed() {
+            let custom = TileColor::Custom(rgb);
+            actions.push(Action::Editor(EditorAction::Color(Some(custom))));
         }
     });
 }

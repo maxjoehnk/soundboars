@@ -39,6 +39,13 @@ pub fn default_name(file_stem: &str, clip: u32) -> String {
     }
 }
 
+/// The name to save for a clip whose name was edited to `name`: `None` (show `default`) when it's
+/// blank or just `default`.
+pub fn saved_name(name: &str, default: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty() && name != default).then(|| name.to_owned())
+}
+
 /// The file name without extension.
 pub fn file_stem(path: &Path) -> String {
     path.file_stem()
@@ -65,8 +72,9 @@ impl AppState {
         ids.map(|clip| ClipId::new(path, clip)).collect()
     }
 
-    /// Adds a clip of the same file as `source` with its name (numbered), volume and trim, but
-    /// without its triggers: two tiles never share one. Returns the new clip.
+    /// Adds a clip of the same file as `source` with its name (numbered), volume, trim and color,
+    /// but without its triggers: two tiles never share one. It's shown right after `source`.
+    /// Returns the new clip.
     pub fn duplicate_clip(&mut self, source: &ClipId) -> Option<ClipId> {
         let copied = self.sound_config(source)?;
         let taken: Vec<String> = (self.clips_of(&source.path).iter())
@@ -82,13 +90,16 @@ impl AppState {
                 volume: copied.volume,
                 start_ms: copied.start_ms,
                 end_ms: copied.end_ms,
+                color: copied.color,
                 ..SoundConfig::default()
             },
         });
-        Some(ClipId::new(&source.path, id))
+        let copy = ClipId::new(&source.path, id);
+        self.order_after(source, &copy);
+        Some(copy)
     }
 
-    /// Removes one of the more clips of a file; returns whether it did. The file's own clip stays
+    /// Removes one of the more clips of a file (also from its tab's order); returns whether it did. The file's own clip stays
     /// as long as the file is in the folder.
     pub fn delete_clip(&mut self, clip: &ClipId) -> bool {
         if clip.clip == 0 {
@@ -99,7 +110,11 @@ impl AppState {
         };
         let before = file.clips.len();
         file.clips.retain(|extra| extra.id != clip.clip);
-        file.clips.len() != before
+        if file.clips.len() == before {
+            return false;
+        }
+        self.forget_order(clip);
+        true
     }
 }
 
@@ -108,7 +123,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::config::{Config, TabConfig};
+    use crate::config::{ClipKey, Config, TabConfig};
     use crate::midi::{MidiBinding, MidiControl};
 
     struct Fixture {
@@ -161,6 +176,13 @@ mod tests {
     }
 
     #[test]
+    fn names_are_saved_only_when_they_differ_from_the_default() {
+        assert_eq!(saved_name(" Horn ", "Airhorn").as_deref(), Some("Horn"));
+        assert_eq!(saved_name(" Airhorn ", "Airhorn"), None);
+        assert_eq!(saved_name("  ", "Airhorn"), None);
+    }
+
+    #[test]
     fn numbered_names_skip_taken_numbers() {
         let taken = ["Airhorn (2)".to_owned(), "Airhorn (3)".to_owned()];
         assert_eq!(numbered_name("Airhorn", &[]), "Airhorn (2)");
@@ -168,8 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicates_copy_name_volume_and_trim_but_not_triggers() {
+    fn duplicates_copy_name_volume_trim_and_color_but_not_triggers() {
         let mut f = fixture();
+        f.state.sound_config_mut(&f.clip(0)).expect("exists").color = "teal".parse().ok();
         let copy = f.state.duplicate_clip(&f.clip(0)).expect("duplicated");
         assert_eq!(copy, f.clip(1));
         assert_eq!(
@@ -179,6 +202,7 @@ mod tests {
                 volume: 0.5,
                 start_ms: 100,
                 end_ms: Some(900),
+                color: "teal".parse().ok(),
                 ..SoundConfig::default()
             })
         );
@@ -206,6 +230,26 @@ mod tests {
             "ids are never reused while higher ones exist"
         );
         assert_eq!(f.state.display_name(&after_delete), "Airhorn (2)");
+    }
+
+    #[test]
+    fn duplicates_follow_their_source_in_a_saved_order_and_leave_it_when_deleted() {
+        let mut f = fixture();
+        fs::write(f.dir.path().join("Bruh.wav"), b"").expect("write");
+        f.state.library.changed(&f.dir.path().join("Bruh.wav"));
+        let order = ["Bruh.wav", "Airhorn.wav", "Airhorn.wav#5"].map(ClipKey::from);
+        f.state.config.tabs[0].order = order.to_vec();
+        let copy = f.state.duplicate_clip(&f.clip(0)).expect("duplicated");
+        let shown: Vec<String> = (f.state.visible_clips().iter())
+            .map(|clip| f.state.display_name(clip))
+            .collect();
+        assert_eq!(shown, ["Bruh", "Airhorn", "Airhorn (2)"]);
+        assert_eq!(
+            f.state.config.tabs[0].order,
+            ["Bruh.wav", "Airhorn.wav", "Airhorn.wav#1", "Airhorn.wav#5"].map(ClipKey::from)
+        );
+        assert!(f.state.delete_clip(&copy));
+        assert_eq!(f.state.config.tabs[0].order, order, "stale #5 stays");
     }
 
     #[test]

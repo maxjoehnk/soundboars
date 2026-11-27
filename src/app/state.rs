@@ -11,6 +11,7 @@ use crate::library::Library;
 
 use super::clips::{ClipId, default_name, file_stem};
 use super::midi::MidiState;
+use super::rename::Rename;
 use super::sound_editor::SoundEditor;
 use super::targets::Targets;
 use super::url_import::UrlImport;
@@ -34,6 +35,8 @@ pub struct AppState {
     pub settings_open: bool,
     /// The "Edit sound" window, while open.
     pub editor: Option<SoundEditor>,
+    /// The "Rename sound" window, while open.
+    pub rename: Option<Rename>,
     /// What the running hotkey backend can do.
     pub hotkey_capabilities: Capabilities,
     /// The hotkey backend used while the settings don't choose one.
@@ -62,6 +65,7 @@ impl AppState {
             audio_available: true,
             settings_open: false,
             editor: None,
+            rename: None,
             hotkey_capabilities: Capabilities::default(),
             default_hotkey_backend: BackendKind::default_for_session(),
             recording_stop_all: false,
@@ -76,15 +80,12 @@ impl AppState {
     }
 
     /// The tiles to show: the search results across all tabs while searching, else the clips of
-    /// the selected tab's sounds (each file's own clip followed by its more clips).
+    /// the selected tab's sounds in the tab's order (see [`Self::tab_clips`]).
     pub fn visible_clips(&self) -> Vec<ClipId> {
         if self.is_searching() {
             return self.search_results();
         }
-        let sounds = self.library.folders().get(self.tab).into_iter();
-        (sounds.flat_map(|folder| &folder.sounds))
-            .flat_map(|sound| self.clips_of(&sound.path))
-            .collect()
+        self.tab_clips()
     }
 
     /// Clips of all tabs whose shown name or file name contains the search, ignoring case.
@@ -171,19 +172,31 @@ impl AppState {
             .collect()
     }
 
-    /// The second line of a tile: the trimmed length once known, else the file format; then what
-    /// triggers the sound, e.g. `0:01.20 · Note 36 · Ctrl+F13`.
+    /// What a tile says below its name, e.g. `0:01.20 · Note 36 · Ctrl+F13`: its
+    /// [`Self::length_label`] and [`Self::trigger_label`].
     pub fn subtitle(&self, clip: &ClipId) -> String {
+        let parts = [self.length_label(clip), self.trigger_label(clip)];
+        let parts: Vec<String> = parts.into_iter().filter(|part| !part.is_empty()).collect();
+        parts.join(" · ")
+    }
+
+    /// The trimmed length of the clip once known, else the file format, e.g. `0:01.20` or `MP3`.
+    pub fn length_label(&self, clip: &ClipId) -> String {
         let meta = self.sound_config(clip).unwrap_or_default();
-        let length = match self.durations.get(&clip.path) {
+        match self.durations.get(&clip.path) {
             Some(&length) => format_duration(meta.trimmed_length(length)),
             None => (self.library.find(&clip.path))
                 .map(|(_, sound)| sound.format())
                 .unwrap_or_default(),
-        };
+        }
+    }
+
+    /// What triggers the clip, e.g. `Note 36 · Ctrl+F13`; empty if nothing does.
+    pub fn trigger_label(&self, clip: &ClipId) -> String {
+        let meta = self.sound_config(clip).unwrap_or_default();
         let midi = meta.midi.map(|binding| binding.control.to_string());
         let hotkey = meta.hotkey.map(|hotkey| hotkey.to_string());
-        let parts: Vec<String> = [Some(length), midi, hotkey].into_iter().flatten().collect();
+        let parts: Vec<String> = [midi, hotkey].into_iter().flatten().collect();
         parts.join(" · ")
     }
 
@@ -214,7 +227,7 @@ mod tests {
 
     use super::*;
     use crate::audio::Trim;
-    use crate::config::{ClipConfig, TabConfig};
+    use crate::config::{ClipConfig, ClipKey, TabConfig};
     use crate::midi::{MidiBinding, MidiControl};
 
     struct Fixture {
@@ -504,5 +517,68 @@ mod tests {
             control: MidiControl::ControlChange(20),
         });
         assert_eq!(f.state.subtitle(&bruh), "WAV · CC 20");
+        assert_eq!(f.state.length_label(&bruh), "WAV");
+        assert_eq!(f.state.trigger_label(&bruh), "CC 20");
+    }
+
+    #[test]
+    fn footer_labels_split_the_length_from_the_triggers() {
+        let mut f = fixture();
+        let intro = add_intro(&mut f.state);
+        f.state.sound_config_mut(&intro).expect("exists").hotkey = "Ctrl+F13".parse().ok();
+        f.state
+            .durations
+            .insert(intro.path.clone(), Duration::from_secs(2));
+        assert_eq!(f.state.length_label(&intro), "0:00.30");
+        assert_eq!(f.state.trigger_label(&intro), "Note 36 · Ctrl+F13");
+        assert_eq!(f.state.subtitle(&intro), "0:00.30 · Note 36 · Ctrl+F13");
+        let bruh = f.state.visible_clips()[2].clone();
+        assert_eq!(f.state.trigger_label(&bruh), "");
+        assert_eq!(f.state.subtitle(&bruh), "WAV");
+    }
+
+    #[test]
+    fn the_tab_shows_its_saved_order_but_search_results_do_not() {
+        let mut f = fixture();
+        let intro = add_intro(&mut f.state);
+        f.state.config.tabs[0].order = ["Bruh.wav", "gone.wav", "Airhorn.mp3#1"]
+            .map(ClipKey::from)
+            .to_vec();
+        assert_eq!(shown(&f.state), ["Bruh", "Intro", "Airhorn"]);
+        f.state.search = "r".to_owned();
+        assert_eq!(
+            names(f.state.visible_clips()),
+            ["Airhorn", "Airhorn", "Bruh", "Horn"]
+        );
+
+        f.state.search.clear();
+        let airhorn = ClipId::file(&intro.path);
+        assert!(f.state.move_clip(&airhorn, &intro, false));
+        assert_eq!(shown(&f.state), ["Bruh", "Airhorn", "Intro"]);
+        assert!(!f.state.move_clip(&airhorn, &intro, false), "already there");
+        assert!(f.state.sort_by_name());
+        assert_eq!(shown(&f.state), ["Airhorn", "Intro", "Bruh"]);
+        assert!(!f.state.sort_by_name());
+    }
+
+    #[test]
+    fn clips_only_move_within_the_selected_tab() {
+        let mut f = fixture();
+        let [airhorn, bruh] = [0, 1].map(|index| f.state.visible_clips()[index].clone());
+        f.state.select_tab(1);
+        let horn = f.state.visible_clips()[1].clone();
+        assert!(!f.state.move_clip(&horn, &airhorn, false));
+        assert!(
+            !f.state.move_clip(&bruh, &airhorn, false),
+            "not the selected tab"
+        );
+        f.state.select_tab(0);
+        assert!(f.state.move_clip(&bruh, &airhorn, false));
+        assert_eq!(shown(&f.state), ["Bruh", "Airhorn"]);
+        assert_eq!(
+            f.state.config.tabs[0].order,
+            ["Bruh.wav", "Airhorn.mp3"].map(ClipKey::from)
+        );
+        assert!(f.state.config.tabs[1].order.is_empty());
     }
 }

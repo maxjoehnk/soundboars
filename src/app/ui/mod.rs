@@ -5,8 +5,10 @@ mod bottom_bar;
 mod dialog;
 mod hotkey_section;
 mod midi_section;
+mod rename;
 mod settings;
 mod sound_editor;
+mod tile_color;
 mod top_bar;
 mod url_import;
 
@@ -23,6 +25,7 @@ pub enum View {
     Settings,
     SoundEditor,
     UrlImport,
+    Rename,
 }
 
 /// Draws the window `view` (a closed dialog draws nothing).
@@ -33,6 +36,7 @@ pub fn draw(ui: &mut egui::Ui, state: &AppState, view: View) -> Vec<Action> {
         View::Settings => settings::body(ui, state, &mut actions),
         View::SoundEditor => sound_editor::body(ui, state, &mut actions),
         View::UrlImport => url_import::body(ui, state, &mut actions),
+        View::Rename => rename::body(ui, state, &mut actions),
     }
     actions
 }
@@ -43,6 +47,7 @@ pub fn dialogs(state: &AppState) -> Vec<Dialog> {
         settings::dialog(state),
         sound_editor::dialog(state),
         url_import::dialog(state),
+        rename::dialog(state),
     ]
     .into_iter()
     .flatten()

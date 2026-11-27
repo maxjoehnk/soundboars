@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::accesskit::Role;
-use eframe::egui::{Key, Modifiers, Pos2, ViewportEvent, ViewportId};
+use eframe::egui::{Key, Modifiers, PointerButton, Pos2, Vec2, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use soundboars::app::{
@@ -17,8 +17,9 @@ use soundboars::app::{
 use soundboars::audio::{
     Destination, EngineEvent, Peak, PlayRequest, Playing, RecordingApp, Retrigger, Trim, Waveform,
 };
+use soundboars::color::{Preset, TileColor};
 use soundboars::config::{
-    ClipConfig, Config, ConfigStore, Injection, SavedTarget, SoundConfig, TabConfig, Theme,
+    ClipConfig, ClipKey, Config, ConfigStore, Injection, SavedTarget, SoundConfig, TabConfig, Theme,
 };
 use soundboars::hotkeys::{
     BackendKind, BindHint, Binding, Capabilities, EventSink, Hotkey, HotkeyBackend, HotkeyEvent,
@@ -951,6 +952,12 @@ fn renaming_shows_the_new_name_on_the_tile_and_keeps_the_file() {
     harness.get_by_label("Rename…").click();
     harness.run();
 
+    assert!(harness.query_by_label(RENAME).is_some());
+    assert!(
+        harness.query_by_label(EDITOR).is_none(),
+        "not the big editor"
+    );
+    assert!(harness.query_by_label("File: Airhorn.wav").is_some());
     let field = harness.get_by_label("Name:");
     assert!(field.is_focused());
     assert_eq!(field.value().as_deref(), Some("Airhorn"));
@@ -959,6 +966,7 @@ fn renaming_shows_the_new_name_on_the_tile_and_keeps_the_file() {
     harness.run();
     click_editor_button(&mut harness, "Save");
 
+    assert!(harness.query_by_label(RENAME).is_none());
     assert_eq!(saved_airhorn(&setup).name.as_deref(), Some("Horn of doom"));
     assert!(airhorn(&setup).exists());
     assert!(harness.query_by_label_contains("Horn of doom\n").is_some());
@@ -2186,4 +2194,230 @@ fn without_tabs_the_dialog_asks_for_a_folder_first() {
         downloads(&setup),
         [("https://example.com/a".to_owned(), music)]
     );
+}
+
+// Rename dialog, tile layout, colors and order.
+
+const RENAME: &str = "Rename sound";
+
+#[test]
+fn enter_saves_the_rename_dialog_and_escape_cancels_it() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+
+    tile_menu(&mut harness, "Airhorn", "Rename…");
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.get_by_label("Name:").type_text("Not saved");
+    harness.run();
+    harness.key_press(Key::Escape);
+    harness.run();
+    assert!(harness.query_by_label(RENAME).is_none());
+    assert_eq!(saved_airhorn(&setup).name, None);
+    assert!(harness.query_by_label(&tile("Airhorn")).is_some());
+
+    tile_menu(&mut harness, "Airhorn", "Rename…");
+    assert_eq!(
+        harness.get_by_label("Name:").value().as_deref(),
+        Some("Airhorn")
+    );
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.get_by_label("Name:").type_text("Horn of doom");
+    harness.run();
+    harness.key_press(Key::Enter);
+    harness.run();
+
+    assert!(harness.query_by_label(RENAME).is_none());
+    assert_eq!(saved_airhorn(&setup).name.as_deref(), Some("Horn of doom"));
+    assert!(harness.query_by_label(&tile("Horn of doom")).is_some());
+}
+
+#[test]
+fn deleting_the_clip_being_renamed_closes_the_rename_dialog() {
+    // Four more clips of Airhorn: "C" and "D" are right of the rename window (kittest embeds it in
+    // the main window, over the first tiles).
+    let setup = Setup::new().with_config(|config| {
+        let airhorn = config.tabs[0].sounds.get_mut("Airhorn.wav");
+        let airhorn = airhorn.expect("configured");
+        for (id, name) in (1..).zip(["A", "B", "C", "D"]) {
+            airhorn.clips.push(ClipConfig {
+                id,
+                config: SoundConfig {
+                    name: Some(name.to_owned()),
+                    ..SoundConfig::default()
+                },
+            });
+        }
+    });
+    let mut harness = setup.start();
+
+    tile_menu(&mut harness, "D", "Rename…");
+    tile_menu(&mut harness, "C", "Rename…");
+    assert_eq!(
+        harness.get_by_label("Name:").value().as_deref(),
+        Some("C"),
+        "replaces the one for D"
+    );
+    tile_menu(&mut harness, "C", "Delete clip");
+
+    assert!(harness.query_by_label(RENAME).is_none());
+}
+
+/// Long real-world names (one with an emoji) next to short ones.
+const LONG_NAMES: [&str; 4] = [
+    "Scheiße die Bullen - Haben wir noch Pepps?",
+    "HUH❓ Cat meme - Sound Button",
+    "Der is bisschen ein Otto geworden",
+    "Parkour",
+];
+
+fn setup_with_long_names() -> Setup {
+    let setup = Setup::new();
+    for name in LONG_NAMES {
+        fs::write(setup.folder("Memes").join(format!("{name}.wav")), b"").expect("write");
+    }
+    setup
+}
+
+#[test]
+fn tiles_all_have_the_same_size_in_equal_columns() {
+    let setup = setup_with_long_names();
+    let harness = setup.start();
+
+    let names = ["Airhorn", "Bruh"].into_iter().chain(LONG_NAMES);
+    let rects: Vec<_> = names
+        .map(|name| harness.get_by_label(&tile(name)).rect())
+        .collect();
+    for rect in &rects {
+        assert_eq!(rect.size(), Vec2::new(180.0, 90.0), "{rects:?}");
+    }
+    let mut lefts: Vec<f32> = rects.iter().map(|rect| rect.left()).collect();
+    lefts.sort_by(f32::total_cmp);
+    lefts.dedup();
+    for pair in lefts.windows(2) {
+        assert_eq!(pair[1] - pair[0], 188.0, "{lefts:?}");
+    }
+}
+
+#[test]
+fn the_tile_menu_colors_a_tile_and_it_is_saved() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+
+    tile_menu(&mut harness, "Airhorn", "Red");
+    assert_eq!(
+        saved_airhorn(&setup).color,
+        Some(TileColor::Preset(Preset::Red))
+    );
+    let text = fs::read_to_string(setup.store.path()).expect("read");
+    assert!(text.contains("color = \"red\""), "{text}");
+
+    tile_menu(&mut harness, "Airhorn", "None");
+    assert_eq!(saved_airhorn(&setup).color, None);
+}
+
+#[test]
+fn the_editor_color_section_is_saved_with_the_sound() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+
+    open_editor(&mut harness);
+    harness.get_by_label("Teal").click();
+    harness.run();
+    assert_eq!(saved_airhorn(&setup).color, None, "not before saving");
+    click_editor_button(&mut harness, "Save");
+
+    assert_eq!(
+        saved_airhorn(&setup).color,
+        Some(TileColor::Preset(Preset::Teal))
+    );
+}
+
+/// Drags the tile `from` onto the left (or right, `after`) half of the tile `to` and drops it.
+fn drag_tile(harness: &mut Harness<'_, AppWindows>, from: &str, to: &str, after: bool) {
+    let start = harness.get_by_label_contains(&tile(from)).rect().center();
+    let target = harness.get_by_label_contains(&tile(to)).rect().center();
+    let end = target + Vec2::new(if after { 40.0 } else { -40.0 }, 0.0);
+    harness.hover_at(start);
+    harness.run();
+    harness.drag_at(start);
+    harness.run();
+    harness.hover_at(start + Vec2::new(20.0, 0.0));
+    harness.run();
+    harness.hover_at(end);
+    harness.run();
+    // Not `drop_at`: the pointer stays where it was released, like a real mouse.
+    harness.event(eframe::egui::Event::PointerButton {
+        pos: end,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run();
+}
+
+fn left_of(harness: &Harness<'_, AppWindows>, name: &str) -> f32 {
+    harness.get_by_label_contains(&tile(name)).rect().left()
+}
+
+#[test]
+fn dragging_a_tile_onto_another_reorders_the_tab_and_a_click_still_plays() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    setup.shared.clear_calls();
+
+    drag_tile(&mut harness, "Bruh", "Airhorn", false);
+
+    assert!(left_of(&harness, "Bruh") < left_of(&harness, "Airhorn"));
+    assert_eq!(
+        setup.config().tabs[0].order,
+        [ClipKey::new("Bruh.wav", 0), ClipKey::new("Airhorn.wav", 0)]
+    );
+    assert!(
+        setup.shared.calls().is_empty(),
+        "dragging doesn't play: {:?}",
+        setup.shared.calls()
+    );
+
+    drag_tile(&mut harness, "Bruh", "Airhorn", true);
+    assert!(left_of(&harness, "Airhorn") < left_of(&harness, "Bruh"));
+
+    assert_eq!(
+        click_tile(&setup, &mut harness, "Bruh"),
+        [Call::Play(PlayRequest {
+            path: setup.folder("Memes").join("Bruh.wav"),
+            clip: 0,
+            trim: None,
+            volume: 1.0,
+            destination: Destination::Everywhere,
+        })]
+    );
+}
+
+#[test]
+fn sort_by_name_forgets_the_dragged_order() {
+    let setup = Setup::new().with_config(|config| {
+        config.tabs[0].order = vec![ClipKey::new("Bruh.wav", 0), ClipKey::new("Gone.wav", 0)];
+    });
+    let mut harness = setup.start();
+    assert!(left_of(&harness, "Bruh") < left_of(&harness, "Airhorn"));
+
+    tile_menu(&mut harness, "Airhorn", "Sort by name");
+
+    assert!(left_of(&harness, "Airhorn") < left_of(&harness, "Bruh"));
+    assert!(setup.config().tabs[0].order.is_empty());
+}
+
+#[test]
+fn tiles_cannot_be_dragged_while_searching() {
+    let setup = Setup::new();
+    let mut harness = setup.start();
+    let search = harness.get_by_role(Role::TextInput);
+    search.click();
+    search.type_text("r");
+    harness.run();
+
+    drag_tile(&mut harness, "Bruh", "Airhorn", false);
+
+    assert!(left_of(&harness, "Airhorn") < left_of(&harness, "Bruh"));
+    assert!(setup.config().tabs[0].order.is_empty());
 }

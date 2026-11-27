@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::audio::{Destination, PlayRequest, Playing, Trim, Waveform};
+use crate::color::TileColor;
 use crate::config::SoundConfig;
 use crate::hotkeys::Hotkey;
 use crate::midi::MidiBinding;
@@ -22,6 +23,8 @@ pub enum EditorAction {
     /// The name field got the keyboard focus that [`SoundEditor::focus_name`] asked for.
     NameFocused,
     Volume(f32),
+    /// The tile's color; `None` is the theme's default.
+    Color(Option<TileColor>),
     Start(u64),
     End(u64),
     /// The pointer went down on the waveform at this time: grab the nearer handle and move it there.
@@ -73,7 +76,7 @@ pub struct SoundEditor {
     pub file_name: String,
     /// The name shown on the tile, as edited (see [`Self::saved_name`]).
     pub name: String,
-    /// The name field should take the keyboard focus (the editor was opened to rename the sound).
+    /// The name field should take the keyboard focus (the editor was opened for a new duplicate).
     pub focus_name: bool,
     pub volume: f32,
     pub start_ms: u64,
@@ -92,6 +95,7 @@ pub struct SoundEditor {
     /// As learned or saved, with its port if it has one; see [`Self::midi_binding`].
     pub midi: Option<MidiBinding>,
     pub midi_any_device: bool,
+    pub color: Option<TileColor>,
 }
 
 impl SoundEditor {
@@ -120,6 +124,7 @@ impl SoundEditor {
             recording: false,
             midi: saved.midi.clone(),
             midi_any_device: saved.midi.as_ref().is_some_and(|midi| midi.port.is_none()),
+            color: saved.color,
         }
     }
 
@@ -160,6 +165,7 @@ impl SoundEditor {
             EditorAction::Name(name) => self.name = name,
             EditorAction::NameFocused => self.focus_name = false,
             EditorAction::Volume(volume) => self.volume = volume.max(0.0),
+            EditorAction::Color(color) => self.color = color,
             EditorAction::Start(ms) => self.set_start(ms),
             EditorAction::End(ms) => self.set_end(ms),
             EditorAction::Grab(ms) => {
@@ -232,8 +238,7 @@ impl SoundEditor {
 
     /// The name to save: `None` (show the default name) when it's blank or just the default.
     pub fn saved_name(&self) -> Option<String> {
-        let name = self.name.trim();
-        (!name.is_empty() && name != self.default_name()).then(|| name.to_owned())
+        clips::saved_name(&self.name, &self.default_name())
     }
 
     /// What the tile shows without a name of its own (see [`clips::default_name`]).
@@ -241,7 +246,7 @@ impl SoundEditor {
         clips::default_name(&clips::file_stem(&self.clip.path), self.clip.clip)
     }
 
-    /// Writes the name, volume, trim, MIDI binding and hotkey into `config`: a trim to the end of
+    /// Writes the name, volume, trim, MIDI binding, hotkey and color into `config`: a trim to the end of
     /// the sound is stored as no end, so the whole sound is played without any trim at all.
     pub fn apply_to(&self, config: &mut SoundConfig) {
         let trim = self.trim().unwrap_or_default();
@@ -252,6 +257,7 @@ impl SoundEditor {
         config.hotkey = self.hotkey;
         config.shortcut_id = self.shortcut_id.clone();
         config.midi = self.midi_binding();
+        config.color = self.color;
     }
 
     /// The edited trim, `None` for the whole sound.
@@ -390,6 +396,21 @@ mod tests {
         assert_eq!(saved(&editor).name, None, "the file name");
         editor.apply(EditorAction::Name("   ".to_owned()));
         assert_eq!(saved(&editor).name, None, "blank");
+    }
+
+    #[test]
+    fn the_color_is_edited_and_saved() {
+        let saved_red = SoundConfig {
+            color: "red".parse().ok(),
+            ..SoundConfig::default()
+        };
+        let mut editor = SoundEditor::open(&ClipId::file("/sounds/a.wav"), &saved_red);
+        assert_eq!(editor.color, saved_red.color);
+        let custom = "#123456".parse().ok();
+        editor.apply(EditorAction::Color(custom));
+        assert_eq!(saved(&editor).color, custom);
+        editor.apply(EditorAction::Color(None));
+        assert_eq!(saved(&editor).color, None);
     }
 
     #[test]

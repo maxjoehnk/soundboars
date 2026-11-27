@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod audio;
+pub mod color;
 pub mod config;
 pub mod hotkeys;
 pub mod import;

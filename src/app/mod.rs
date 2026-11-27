@@ -4,8 +4,11 @@
 //! the `triggers` thread ([`Dispatcher`]).
 
 mod clips;
+mod colors;
 mod hotkeys;
 mod midi;
+mod order;
+mod rename;
 mod services;
 mod sound_editor;
 mod state;
@@ -22,6 +25,7 @@ use eframe::egui;
 
 use crate::audio::decode::probe_duration;
 use crate::audio::{EngineEvent, Retrigger, Waveform};
+use crate::color::TileColor;
 use crate::config::{ConfigStore, Injection, SavedTarget, Settings, TabConfig, Theme};
 use crate::hotkeys::{BackendKind, Hotkey};
 use crate::import::{DownloadEvent, Downloader};
@@ -32,6 +36,7 @@ use crate::midi::{HOTPLUG_POLL, MidiEvent, MidiInput, MidiService, MidiTrigger};
 pub use clips::ClipId;
 pub use hotkeys::STOP_ALL_ID;
 pub use midi::{LearnTarget, MidiAction, MidiState};
+pub use rename::{Rename, RenameAction};
 pub use services::{
     AudioBackend, FolderPicker, HotkeyBackends, Player, PortalFolderPicker, SystemHotkeys,
 };
@@ -74,13 +79,24 @@ pub enum Action {
     DismissError(usize),
     /// Opens the "Edit sound" window for this clip.
     EditSound(ClipId),
-    /// Opens the "Edit sound" window with its name field focused.
+    /// Opens the "Rename sound" window for this clip.
     RenameSound(ClipId),
+    Rename(RenameAction),
     /// Adds a clip of the same file, copying this one's name, volume and trim (not its
     /// triggers), and opens it in the "Edit sound" window to rename and trim it.
     DuplicateClip(ClipId),
     /// Removes one of the more clips of a file (not the file's own).
     DeleteClip(ClipId),
+    /// Colors the clip's tile; `None` is the theme's default.
+    SetColor(ClipId, Option<TileColor>),
+    /// Moves the dragged tile right before (or `after`) the `target` tile of the same tab.
+    MoveClip {
+        dragged: ClipId,
+        target: ClipId,
+        after: bool,
+    },
+    /// Sorts the selected tab's tiles by name again, forgetting their dragged order.
+    SortByName,
     Editor(EditorAction),
     /// Starts (`true`) or cancels recording the "Stop all" hotkey in the settings.
     RecordStopAllHotkey(bool),
@@ -292,8 +308,16 @@ impl App {
             }
             Action::EditSound(clip) => self.edit_sound(&clip),
             Action::RenameSound(clip) => self.rename_sound(&clip),
+            Action::Rename(action) => self.rename_action(action),
             Action::DuplicateClip(clip) => self.duplicate_clip(&clip),
             Action::DeleteClip(clip) => self.delete_clip(&clip),
+            Action::SetColor(clip, color) => self.unsaved |= self.state.set_color(&clip, color),
+            Action::MoveClip {
+                dragged,
+                target,
+                after,
+            } => self.unsaved |= self.state.move_clip(&dragged, &target, after),
+            Action::SortByName => self.unsaved |= self.state.sort_by_name(),
             Action::Editor(action) => self.editor_action(action),
             Action::Midi(action) => self.midi_action(action),
             Action::OpenUrlImport => {
@@ -412,28 +436,55 @@ impl App {
         self.state.editor = Some(editor);
     }
 
-    /// Opens the editor with its name field focused.
+    /// Opens the "Rename sound" window, replacing one open for another clip.
     fn rename_sound(&mut self, clip: &ClipId) {
-        self.edit_sound(clip);
+        match self.state.sound_config(clip) {
+            Some(saved) => self.state.rename = Some(Rename::open(clip, &saved)),
+            None => self.show_error(format!("{} is not in any tab", clip.path.display())),
+        }
+    }
+
+    fn rename_action(&mut self, action: RenameAction) {
+        let Some(rename) = &mut self.state.rename else {
+            return;
+        };
+        match action {
+            RenameAction::Save => {
+                let name = rename.saved_name();
+                let clip = rename.clip.clone();
+                if let Some(config) = self.state.sound_config_mut(&clip) {
+                    config.name = name;
+                    self.unsaved = true;
+                }
+                self.state.rename = None;
+            }
+            RenameAction::Close => self.state.rename = None,
+            _ => rename.edit(action),
+        }
+    }
+
+    /// Adds a copy of the clip and opens it in the editor with its name field focused, for
+    /// renaming and trimming.
+    fn duplicate_clip(&mut self, clip: &ClipId) {
+        let Some(copy) = self.state.duplicate_clip(clip) else {
+            return;
+        };
+        self.unsaved = true;
+        self.edit_sound(&copy);
         if let Some(editor) = &mut self.state.editor {
             editor.focus_name = true;
         }
     }
 
-    /// Adds a copy of the clip and opens it for renaming and trimming.
-    fn duplicate_clip(&mut self, clip: &ClipId) {
-        if let Some(copy) = self.state.duplicate_clip(clip) {
-            self.unsaved = true;
-            self.rename_sound(&copy);
-        }
-    }
-
-    /// Removes the clip, closing the editor if it's open on it.
+    /// Removes the clip, closing the editor and the rename window if they're open on it.
     fn delete_clip(&mut self, clip: &ClipId) {
         if !self.state.delete_clip(clip) {
             return;
         }
         self.unsaved = true;
+        if (self.state.rename.as_ref()).is_some_and(|rename| rename.clip == *clip) {
+            self.state.rename = None;
+        }
         if self
             .state
             .editor

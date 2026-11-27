@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{RecordingApp, Retrigger, Trim};
+use crate::color::{self, TileColor};
 use crate::hotkeys::{self, BackendKind, Hotkey};
 use crate::midi::{MidiBinding, MidiDevice};
 
@@ -116,6 +117,10 @@ pub struct TabConfig {
     /// Keyed by the sound's path relative to [`Self::path`] (with `/` separators).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sounds: BTreeMap<String, SoundConfig>,
+    /// The order of the tiles, as dragged; empty sorts them by file name. Clips that aren't listed
+    /// follow in that order. Entries of files that are gone are kept (they may come back).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<ClipKey>,
 }
 
 impl TabConfig {
@@ -125,6 +130,7 @@ impl TabConfig {
             name: folder_name(&path),
             path,
             sounds: BTreeMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -135,6 +141,58 @@ impl TabConfig {
         } else {
             self.name.clone()
         }
+    }
+}
+
+/// A clip in a tab's [`TabConfig::order`]: the sound's key in [`TabConfig::sounds`] and the clip id
+/// (0 for the file's own clip). Written as the key, plus `#<id>` for more clips:
+/// `"Airhorn.wav"`, `"Airhorn.wav#2"`. Keys end with an audio file extension, so a `#<digits>`
+/// suffix is never part of one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClipKey {
+    pub file: String,
+    pub clip: u32,
+}
+
+impl ClipKey {
+    pub fn new(file: impl Into<String>, clip: u32) -> Self {
+        Self {
+            file: file.into(),
+            clip,
+        }
+    }
+}
+
+impl std::fmt::Display for ClipKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.clip {
+            0 => f.write_str(&self.file),
+            clip => write!(f, "{}#{clip}", self.file),
+        }
+    }
+}
+
+impl From<&str> for ClipKey {
+    fn from(text: &str) -> Self {
+        let numbered = text
+            .rsplit_once('#')
+            .and_then(|(file, clip)| Some((file, clip.parse().ok()?)));
+        match numbered {
+            Some((file, clip)) => Self::new(file, clip),
+            None => Self::new(text, 0),
+        }
+    }
+}
+
+impl Serialize for ClipKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClipKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from(String::deserialize(deserializer)?.as_str()))
     }
 }
 
@@ -167,6 +225,12 @@ pub struct SoundConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shortcut_id: Option<String>,
     pub midi: Option<MidiBinding>,
+    /// The tile's color; `None` is the theme's button color.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "color::deserialize_lenient"
+    )]
+    pub color: Option<TileColor>,
     /// More clips of the same file, e.g. other parts of it, each a tile of its own. The fields
     /// above are the file's own clip (id 0).
     #[serde(
@@ -186,6 +250,7 @@ impl Default for SoundConfig {
             hotkey: None,
             shortcut_id: None,
             midi: None,
+            color: None,
             clips: Vec::new(),
         }
     }
@@ -432,6 +497,7 @@ mod tests {
                     channel: 10,
                     control: MidiControl::Note(36),
                 }),
+                color: "red".parse().ok(),
                 clips: vec![ClipConfig {
                     id: 2,
                     config: SoundConfig {
@@ -446,11 +512,17 @@ mod tests {
                             channel: 10,
                             control: MidiControl::Note(37),
                         }),
+                        color: Some(TileColor::Custom([255, 136, 0])),
                         clips: Vec::new(),
                     },
                 }],
             },
         );
+        tab.order = vec![
+            ClipKey::new("airhorn.mp3", 2),
+            ClipKey::new("gone#1.wav", 0),
+            ClipKey::new("airhorn.mp3", 0),
+        ];
         Config {
             injection: Injection::App,
             settings: Settings {
@@ -516,6 +588,36 @@ mod tests {
         );
         assert!(text.contains("id = 2"), "{text}");
         assert!(text.contains("name = \"Air horn (end)\""), "{text}");
+        assert!(text.contains("color = \"red\""), "{text}");
+        assert!(text.contains("color = \"#ff8800\""), "{text}");
+        let order =
+            "order = [\n    \"airhorn.mp3#2\",\n    \"gone#1.wav\",\n    \"airhorn.mp3\",\n]";
+        assert!(text.contains(order), "{text}");
+    }
+
+    #[test]
+    fn clip_keys_read_their_clip_id_from_a_numeric_suffix() {
+        assert_eq!(ClipKey::from("a.wav"), ClipKey::new("a.wav", 0));
+        assert_eq!(ClipKey::from("a.wav#3"), ClipKey::new("a.wav", 3));
+        assert_eq!(ClipKey::from("a#b.wav"), ClipKey::new("a#b.wav", 0));
+        assert_eq!(ClipKey::from("a.wav#x"), ClipKey::new("a.wav#x", 0));
+        for key in [ClipKey::new("a#1.wav", 0), ClipKey::new("a.wav", 7)] {
+            assert_eq!(ClipKey::from(key.to_string().as_str()), key);
+        }
+    }
+
+    #[test]
+    fn invalid_colors_are_dropped_instead_of_rejecting_the_file() {
+        let text = r#"
+            [[tabs]]
+            path = "/sounds"
+            [tabs.sounds."a.wav"]
+            color = "chartreuse-ish"
+            volume = 0.5
+        "#;
+        let config: Config = toml::from_str(text).expect("valid");
+        let sound = &config.tabs[0].sounds["a.wav"];
+        assert_eq!((sound.color, sound.volume), (None, 0.5));
     }
 
     #[test]
